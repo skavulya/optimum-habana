@@ -947,7 +947,7 @@ class GaudiStableDiffusionUpscalePipeline(
 
                     # compute the previous noisy sample x_t -> x_t-1
                     latents_batch = self.scheduler.step(
-                        noise_pred, latents_batch, **extra_step_kwargs, return_dict=False
+                        noise_pred, timestep, latents_batch, **extra_step_kwargs, return_dict=False
                     )[0]
 
                     if not self.use_hpu_graphs:
