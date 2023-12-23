@@ -864,6 +864,7 @@ class GaudiStableDiffusionPipeline(
             # 4. Prepare timesteps
             self.scheduler.set_timesteps(num_inference_steps, device="cpu")
             timesteps = self.scheduler.timesteps.to(device)
+            self.scheduler.reset_timestep_dependent_params()
 
             # 5. Prepare latent variables
             num_channels_latents = self.unet.config.in_channels
@@ -984,8 +985,6 @@ class GaudiStableDiffusionPipeline(
                 else:
                     image = latents_batch
                 outputs["images"].append(image)
-
-                self.scheduler.reset_timestep_dependent_params()
 
                 if not self.use_hpu_graphs:
                     self.htcore.mark_step()
