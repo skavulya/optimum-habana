@@ -13,6 +13,8 @@
 # limitations under the License.
 
 import inspect
+import time
+from math import ceil
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Union
 
@@ -28,8 +30,8 @@ from diffusers.schedulers import EulerDiscreteScheduler
 from diffusers.utils import BaseOutput, logging
 from diffusers.utils.torch_utils import randn_tensor
 from ....transformers.gaudi_configuration import GaudiConfig
+from ....utils import speed_metrics
 from ..pipeline_utils import GaudiDiffusionPipeline
-
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
@@ -69,6 +71,7 @@ class GaudiStableVideoDiffusionPipelineOutput(BaseOutput):
     """
 
     frames: Union[List[PIL.Image.Image], np.ndarray]
+    throughput: float
 
 
 class GaudiStableVideoDiffusionPipeline(GaudiDiffusionPipeline):
@@ -115,6 +118,8 @@ class GaudiStableVideoDiffusionPipeline(GaudiDiffusionPipeline):
         self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor)
 
     def _encode_image(self, image, device, num_videos_per_prompt, do_classifier_free_guidance):
+        # Adapted from: https://github.com/huggingface/diffusers/blob/v0.24.0-release/src/diffusers/pipelines/stable_video_diffusion/pipeline_stable_video_diffusion.py
+        #     - Support batching by returning image embeddings and negative embeddings separately
         dtype = next(self.image_encoder.parameters()).dtype
 
         if not isinstance(image, torch.Tensor):
@@ -146,15 +151,16 @@ class GaudiStableVideoDiffusionPipeline(GaudiDiffusionPipeline):
         image_embeddings = image_embeddings.repeat(1, num_videos_per_prompt, 1)
         image_embeddings = image_embeddings.view(bs_embed * num_videos_per_prompt, seq_len, -1)
 
+        negative_image_embeddings = None
         if do_classifier_free_guidance:
             negative_image_embeddings = torch.zeros_like(image_embeddings)
 
             # For classifier free guidance, we need to do two forward passes.
             # Here we concatenate the unconditional and text embeddings into a single batch
             # to avoid doing two forward passes
-            image_embeddings = torch.cat([negative_image_embeddings, image_embeddings])
+            # image_embeddings = torch.cat([negative_image_embeddings, image_embeddings])
 
-        return image_embeddings
+        return image_embeddings, negative_image_embeddings
 
     def _encode_vae_image(
         self,
@@ -163,21 +169,25 @@ class GaudiStableVideoDiffusionPipeline(GaudiDiffusionPipeline):
         num_videos_per_prompt,
         do_classifier_free_guidance,
     ):
+        # Adapted from: https://github.com/huggingface/diffusers/blob/v0.24.0-release/src/diffusers/pipelines/stable_video_diffusion/pipeline_stable_video_diffusion.py
+        #     - Support batching by returning image embeddings and negative embeddings separately
         image = image.to(device=device)
         image_latents = self.vae.encode(image).latent_dist.mode()
 
+        negative_image_latents = None
         if do_classifier_free_guidance:
             negative_image_latents = torch.zeros_like(image_latents)
+            negative_image_latents = negative_image_latents.repeat(num_videos_per_prompt, 1, 1, 1)
 
             # For classifier free guidance, we need to do two forward passes.
             # Here we concatenate the unconditional and text embeddings into a single batch
             # to avoid doing two forward passes
-            image_latents = torch.cat([negative_image_latents, image_latents])
+            # image_latents = torch.cat([negative_image_latents, image_latents])
 
         # duplicate image_latents for each generation per prompt, using mps friendly method
         image_latents = image_latents.repeat(num_videos_per_prompt, 1, 1, 1)
 
-        return image_latents
+        return image_latents, negative_image_latents
 
     def _get_add_time_ids(
         self,
@@ -189,6 +199,8 @@ class GaudiStableVideoDiffusionPipeline(GaudiDiffusionPipeline):
         num_videos_per_prompt,
         do_classifier_free_guidance,
     ):
+        # Adapted from: https://github.com/huggingface/diffusers/blob/v0.24.0-release/src/diffusers/pipelines/stable_video_diffusion/pipeline_stable_video_diffusion.py
+        #     - Support batching by returning image embeddings and negative embeddings separately
         add_time_ids = [fps, motion_bucket_id, noise_aug_strength]
 
         passed_add_embed_dim = self.unet.config.addition_time_embed_dim * len(add_time_ids)
@@ -202,10 +214,11 @@ class GaudiStableVideoDiffusionPipeline(GaudiDiffusionPipeline):
         add_time_ids = torch.tensor([add_time_ids], dtype=dtype)
         add_time_ids = add_time_ids.repeat(batch_size * num_videos_per_prompt, 1)
 
+        negative_add_time_ids = None
         if do_classifier_free_guidance:
-            add_time_ids = torch.cat([add_time_ids, add_time_ids])
+            negative_add_time_ids = add_time_ids
 
-        return add_time_ids
+        return add_time_ids, negative_add_time_ids
 
     def decode_latents(self, latents, num_frames, decode_chunk_size=14):
         # [batch, frames, channels, height, width] -> [batch*frames, channels, height, width]
@@ -298,6 +311,111 @@ class GaudiStableVideoDiffusionPipeline(GaudiDiffusionPipeline):
     def num_timesteps(self):
         return self._num_timesteps
 
+    @classmethod
+    def _split_inputs_into_batches(
+            cls,
+            batch_size,
+            latents,
+            image_latents,
+            negative_image_latents,
+            image_embeddings,
+            negative_image_embeddings,
+            added_time_ids,
+            negative_added_time_ids
+    ):
+        # Use torch.split to generate num_batches batches of size batch_size
+        latents_batches = list(torch.split(latents, batch_size))
+        image_latents_batches = list(torch.split(image_latents, batch_size))
+        image_embeddings_batches = list(torch.split(image_embeddings, batch_size))
+        added_time_ids_batches = list(torch.split(added_time_ids, batch_size))
+        if negative_image_latents is not None:
+            negative_image_latents_batches = list(torch.split(negative_image_latents, batch_size))
+        if negative_image_embeddings is not None:
+            negative_image_embeddings_batches = list(torch.split(negative_image_embeddings, batch_size))
+        if negative_added_time_ids is not None:
+            negative_added_time_ids_batches = list(torch.split(negative_added_time_ids, batch_size))
+
+        # If the last batch has less samples than batch_size, pad it with dummy samples
+        num_dummy_samples = 0
+        if latents_batches[-1].shape[0] < batch_size:
+            num_dummy_samples = batch_size - latents_batches[-1].shape[0]
+            # Pad latents_batches
+            sequence_to_stack = (latents_batches[-1],) + tuple(
+                torch.zeros_like(latents_batches[-1][0][None, :]) for _ in range(num_dummy_samples)
+            )
+            latents_batches[-1] = torch.vstack(sequence_to_stack)
+            # Pad image_latents_batches
+            sequence_to_stack = (image_latents_batches[-1],) + tuple(
+                torch.zeros_like(image_latents_batches[-1][0][None, :]) for _ in range(num_dummy_samples)
+            )
+            image_latents_batches[-1] = torch.vstack(sequence_to_stack)
+            # Pad negative_image_latents_batches if necessary
+            if negative_image_latents is not None:
+                # Pad image_latents_batches
+                sequence_to_stack = (negative_image_latents_batches[-1],) + tuple(
+                    torch.zeros_like(negative_image_latents_batches[-1][0][None, :]) for _ in range(num_dummy_samples)
+                )
+                negative_image_latents_batches[-1] = torch.vstack(sequence_to_stack)
+            # Pad image_embeddings_batches
+            sequence_to_stack = (image_embeddings_batches[-1],) + tuple(
+                torch.zeros_like(image_embeddings_batches[-1][0][None, :]) for _ in range(num_dummy_samples)
+            )
+            image_embeddings_batches[-1] = torch.vstack(sequence_to_stack)
+            # Pad negative_image_embeddings_batches if necessary
+            if negative_image_embeddings is not None:
+                # Pad image_latents_batches
+                sequence_to_stack = (negative_image_embeddings_batches[-1],) + tuple(
+                    torch.zeros_like(negative_image_embeddings_batches[-1][0][None, :]) for _ in range(num_dummy_samples)
+                )
+                negative_image_embeddings_batches[-1] = torch.vstack(sequence_to_stack)
+            # Pad added_time_ids_batches
+            sequence_to_stack = (added_time_ids_batches[-1],) + tuple(
+                torch.zeros_like(added_time_ids_batches[-1][0][None, :]) for _ in range(num_dummy_samples)
+            )
+            added_time_ids_batches[-1] = torch.vstack(sequence_to_stack)
+            # Pad negative_image_embeddings_batches if necessary
+            if negative_added_time_ids is not None:
+                # Pad image_latents_batches
+                sequence_to_stack = (negative_added_time_ids_batches[-1],) + tuple(
+                    torch.zeros_like(negative_added_time_ids_batches[-1][0][None, :]) for _ in range(num_dummy_samples)
+                )
+                negative_added_time_ids_batches[-1] = torch.vstack(sequence_to_stack)
+
+        # Stack batches in the same tensor
+        latents_batches = torch.stack(latents_batches)
+
+        if negative_image_latents is not None:
+            # For classifier free guidance, we need to do two forward passes.
+            # Here we concatenate the unconditional and text embeddings into a single batch
+            # to avoid doing two forward passes
+            for i, (negative_image_latents_batch, image_latents_batch) in enumerate(
+                    zip(negative_image_latents_batches, image_latents_batches[:])
+            ):
+                image_latents_batches[i] = torch.cat([negative_image_latents_batch, image_latents_batch])
+        image_latents_batches = torch.stack(image_latents_batches)
+
+        if negative_image_embeddings is not None:
+            # For classifier free guidance, we need to do two forward passes.
+            # Here we concatenate the unconditional and text embeddings into a single batch
+            # to avoid doing two forward passes
+            for i, (negative_image_embeddings_batch, image_embeddings_batch) in enumerate(
+                    zip(negative_image_embeddings_batches, image_embeddings_batches[:])
+            ):
+                image_embeddings_batches[i] = torch.cat([negative_image_embeddings_batch, image_embeddings_batch])
+        image_embeddings_batches = torch.stack(image_embeddings_batches)
+
+        if negative_image_embeddings is not None:
+            # For classifier free guidance, we need to do two forward passes.
+            # Here we concatenate the unconditional and text embeddings into a single batch
+            # to avoid doing two forward passes
+            for i, (negative_added_time_ids_batch, added_time_ids_batch) in enumerate(
+                    zip(negative_added_time_ids_batches, added_time_ids_batches[:])
+            ):
+                added_time_ids_batches[i] = torch.cat([negative_added_time_ids_batch, added_time_ids_batch])
+        added_time_ids_batches = torch.stack(added_time_ids_batches)
+
+        return latents_batches, image_latents_batches, image_embeddings_batches, added_time_ids_batches, num_dummy_samples
+
     @torch.no_grad()
     def __call__(
         self,
@@ -305,6 +423,7 @@ class GaudiStableVideoDiffusionPipeline(GaudiDiffusionPipeline):
         height: int = 576,
         width: int = 1024,
         num_frames: Optional[int] = None,
+        batch_size: int = 1,
         num_inference_steps: int = 25,
         min_guidance_scale: float = 1.0,
         max_guidance_scale: float = 3.0,
@@ -333,6 +452,8 @@ class GaudiStableVideoDiffusionPipeline(GaudiDiffusionPipeline):
                 The width in pixels of the generated image.
             num_frames (`int`, *optional*):
                 The number of video frames to generate. Defaults to 14 for `stable-video-diffusion-img2vid` and to 25 for `stable-video-diffusion-img2vid-xt`
+            batch_size (`int`, *optional*, defaults to 1):
+                The number of images in a batch.
             num_inference_steps (`int`, *optional*, defaults to 25):
                 The number of denoising steps. More denoising steps usually lead to a higher quality image at the
                 expense of slower inference. This parameter is modulated by `strength`.
@@ -408,11 +529,19 @@ class GaudiStableVideoDiffusionPipeline(GaudiDiffusionPipeline):
 
         # 2. Define call parameters
         if isinstance(image, PIL.Image.Image):
-            batch_size = 1
+            num_images = 1
         elif isinstance(image, list):
-            batch_size = len(image)
+            num_images = len(image)
         else:
-            batch_size = image.shape[0]
+            num_images = image.shape[0]
+        num_batches = ceil((num_videos_per_prompt * num_images) / batch_size)
+        logger.info(
+            f"{num_images} image(s) received, {num_videos_per_prompt} video(s) per prompt,"
+            f" {batch_size} sample(s) per batch, {num_batches} total batch(es)."
+        )
+        if num_batches < 3:
+            logger.warning("The first two iterations are slower so it is recommended to feed more batches.")
+
         device = self._execution_device
         # here `guidance_scale` is defined analog to the guidance weight `w` of equation (2)
         # of the Imagen paper: https://arxiv.org/pdf/2205.11487.pdf . `guidance_scale = 1`
@@ -420,7 +549,12 @@ class GaudiStableVideoDiffusionPipeline(GaudiDiffusionPipeline):
         do_classifier_free_guidance = max_guidance_scale > 1.0
 
         # 3. Encode input image
-        image_embeddings = self._encode_image(image, device, num_videos_per_prompt, do_classifier_free_guidance)
+        image_embeddings, negative_image_embeddings = self._encode_image(
+            image,
+            device,
+            num_videos_per_prompt,
+            do_classifier_free_guidance
+        )
 
         # NOTE: Stable Diffusion Video was conditioned on fps - 1, which
         # is why it is reduced here.
@@ -436,7 +570,12 @@ class GaudiStableVideoDiffusionPipeline(GaudiDiffusionPipeline):
         if needs_upcasting:
             self.vae.to(dtype=torch.float32)
 
-        image_latents = self._encode_vae_image(image, device, num_videos_per_prompt, do_classifier_free_guidance)
+        image_latents, negative_image_latents = self._encode_vae_image(
+            image,
+            device,
+            num_videos_per_prompt,
+            do_classifier_free_guidance
+        )
         image_latents = image_latents.to(image_embeddings.dtype)
 
         # cast back to fp16 if needed
@@ -446,18 +585,23 @@ class GaudiStableVideoDiffusionPipeline(GaudiDiffusionPipeline):
         # Repeat the image latents for each frame so we can concatenate them with the noise
         # image_latents [batch, channels, height, width] ->[batch, num_frames, channels, height, width]
         image_latents = image_latents.unsqueeze(1).repeat(1, num_frames, 1, 1, 1)
+        if negative_image_latents is not None:
+            negative_image_latents = negative_image_latents.to(image_embeddings.dtype)
+            negative_image_latents = negative_image_latents.unsqueeze(1).repeat(1, num_frames, 1, 1, 1)
 
         # 5. Get Added Time IDs
-        added_time_ids = self._get_add_time_ids(
+        added_time_ids, negative_added_time_ids = self._get_add_time_ids(
             fps,
             motion_bucket_id,
             noise_aug_strength,
             image_embeddings.dtype,
-            batch_size,
+            num_images,
             num_videos_per_prompt,
             do_classifier_free_guidance,
         )
         added_time_ids = added_time_ids.to(device)
+        if negative_added_time_ids is not None:
+            negative_added_time_ids = negative_added_time_ids.to(device)
 
         # 4. Prepare timesteps
         self.scheduler.set_timesteps(num_inference_steps, device=device)
@@ -466,7 +610,7 @@ class GaudiStableVideoDiffusionPipeline(GaudiDiffusionPipeline):
         # 5. Prepare latent variables
         num_channels_latents = self.unet.config.in_channels
         latents = self.prepare_latents(
-            batch_size * num_videos_per_prompt,
+            num_images * num_videos_per_prompt,
             num_frames,
             num_channels_latents,
             height,
@@ -480,29 +624,64 @@ class GaudiStableVideoDiffusionPipeline(GaudiDiffusionPipeline):
         # 7. Prepare guidance scale
         guidance_scale = torch.linspace(min_guidance_scale, max_guidance_scale, num_frames).unsqueeze(0)
         guidance_scale = guidance_scale.to(device, latents.dtype)
-        guidance_scale = guidance_scale.repeat(batch_size * num_videos_per_prompt, 1)
+        guidance_scale = guidance_scale.repeat(num_images * num_videos_per_prompt, 1) # TODO: change to batch size?
         guidance_scale = _append_dims(guidance_scale, latents.ndim)
 
         self._guidance_scale = guidance_scale
 
-        # 8. Denoising loop
+        # 8. Split into batches (HPU-specific step)
+        latents_batches, image_latents_batches, image_embeddings_batches, added_time_ids_batches, num_dummy_samples = self._split_inputs_into_batches(
+            batch_size,
+            latents,
+            image_latents,
+            negative_image_latents,
+            image_embeddings,
+            negative_image_embeddings,
+            added_time_ids,
+            negative_added_time_ids
+        )
+
+        outputs = {
+            "frames": [],
+        }
+        t0 = time.time()
+        t1 = t0
+
+        # 9. Denoising loop
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
         self._num_timesteps = len(timesteps)
-        with self.progress_bar(total=num_inference_steps) as progress_bar:
-            for i, t in enumerate(timesteps):
+        for j in self.progress_bar(range(num_batches)):
+            # The throughput is calculated from the 3rd iteration
+            # because compilation occurs in the first two iterations
+            if j == 2:
+                t1 = time.time()
+
+            latents_batch = latents_batches[0]
+            latents_batches = torch.roll(latents_batches, shifts=-1, dims=0)
+            image_latents_batch = image_latents_batches[0]
+            image_latents_batches = torch.roll(image_latents_batches, shifts=-1, dims=0)
+            image_embeddings_batch = image_embeddings_batches[0]
+            image_embeddings_batches = torch.roll(image_embeddings_batches, shifts=-1, dims=0)
+            added_time_ids_batch = added_time_ids_batches[0]
+            added_time_ids_batches = torch.roll(added_time_ids_batches, shifts=-1, dims=0)
+
+            for i in range(num_inference_steps):
+                timestep = timesteps[0]
+                timesteps = torch.roll(timesteps, shifts=-1, dims=0)
+
                 # expand the latents if we are doing classifier free guidance
-                latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
-                latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
+                latent_model_input = torch.cat([latents_batch] * 2) if do_classifier_free_guidance else latents_batch
+                latent_model_input = self.scheduler.scale_model_input(latent_model_input, timestep)
 
                 # Concatenate image_latents over channels dimention
-                latent_model_input = torch.cat([latent_model_input, image_latents], dim=2)
+                latent_model_input = torch.cat([latent_model_input, image_latents_batch], dim=2)
 
                 # predict the noise residual
                 noise_pred = self.unet(
                     latent_model_input,
-                    t,
-                    encoder_hidden_states=image_embeddings,
-                    added_time_ids=added_time_ids,
+                    timestep,
+                    encoder_hidden_states=image_embeddings_batch,
+                    added_time_ids=added_time_ids_batch,
                     return_dict=False,
                 )[0]
 
@@ -512,34 +691,60 @@ class GaudiStableVideoDiffusionPipeline(GaudiDiffusionPipeline):
                     noise_pred = noise_pred_uncond + self.guidance_scale * (noise_pred_cond - noise_pred_uncond)
 
                 # compute the previous noisy sample x_t -> x_t-1
-                latents = self.scheduler.step(noise_pred, t, latents).prev_sample
+                latents_batch = self.scheduler.step(noise_pred, timestep, latents_batch).prev_sample
 
                 if callback_on_step_end is not None:
                     callback_kwargs = {}
                     for k in callback_on_step_end_tensor_inputs:
                         callback_kwargs[k] = locals()[k]
-                    callback_outputs = callback_on_step_end(self, i, t, callback_kwargs)
+                    callback_outputs = callback_on_step_end(self, i, timestep, callback_kwargs)
 
-                    latents = callback_outputs.pop("latents", latents)
+                    latents_batch = callback_outputs.pop("latents", latents_batch)
 
-                if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
-                    progress_bar.update()
+                if not output_type == "latent":
+                    # cast back to fp16 if needed
+                    if needs_upcasting:
+                        self.vae.to(dtype=torch.float16)
+                    frames = self.decode_latents(latents_batch, num_frames, decode_chunk_size)
+                    frames = tensor2vid(frames, self.image_processor, output_type=output_type)
+                else:
+                    frames = latents_batch
 
-        if not output_type == "latent":
-            # cast back to fp16 if needed
-            if needs_upcasting:
-                self.vae.to(dtype=torch.float16)
-            frames = self.decode_latents(latents, num_frames, decode_chunk_size)
-            frames = tensor2vid(frames, self.image_processor, output_type=output_type)
-        else:
-            frames = latents
+                outputs["frames"].append(frames)
+
+        speed_metrics_prefix = "generation"
+        speed_measures = speed_metrics(
+            split=speed_metrics_prefix,
+            start_time=t0,
+            num_samples=num_batches * batch_size if t1 == t0 else (num_batches - 2) * batch_size,
+            num_steps=num_batches,
+            start_time_after_warmup=t1,
+        )
+        logger.info(f"Speed metrics: {speed_measures}")
+
+        # Remove dummy generations if needed
+        if num_dummy_samples > 0:
+            outputs["frames"][-1] = outputs["frames"][-1][:-num_dummy_samples]
+
+        # Process generated images
+        for i, frames in enumerate(outputs["frames"][:]):
+            if i == 0:
+                outputs["frames"].clear()
+
+            if output_type == "pil":
+                outputs["frames"] += frames
+            else:
+                outputs["frames"] += [*frames]
 
         self.maybe_free_model_hooks()
 
         if not return_dict:
-            return frames
+            return outputs["frames"]
 
-        return StableVideoDiffusionPipelineOutput(frames=frames)
+        return GaudiStableVideoDiffusionPipelineOutput(
+            frames=outputs["frames"],
+            throughput=speed_measures[f"{speed_metrics_prefix}_samples_per_second"],
+        )
 
 
 # resizing utils
