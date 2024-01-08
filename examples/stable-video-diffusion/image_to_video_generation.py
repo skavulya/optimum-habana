@@ -20,7 +20,7 @@ from pathlib import Path
 
 import torch
 
-from diffusers.utils import load_image
+from diffusers.utils import load_image, export_to_video
 from optimum.habana.diffusers import GaudiEulerDiscreteScheduler
 from optimum.habana.utils import set_seed
 
@@ -201,7 +201,7 @@ def main():
     outputs = pipeline(
         image=input,
         num_videos_per_prompt=args.num_videos_per_prompt,
-        #batch_size=args.batch_size,
+        batch_size=args.batch_size,
         height=args.height,
         width=args.width,
         num_inference_steps=args.num_inference_steps,
@@ -224,8 +224,8 @@ def main():
             video_save_dir = Path(args.video_save_dir)
             video_save_dir.mkdir(parents=True, exist_ok=True)
             logger.info(f"Saving video frames in {video_save_dir.resolve()}...")
-            for i, image in enumerate(outputs.images):
-                image.save(image_save_dir + "/frame_" + str(i).zfill(2) + ".png")
+            for i, frames in enumerate(outputs.frames):
+                export_to_video(frames, args.video_save_dir + "/generated_" + str(i).zfill(2) + ".mp4", fps=7)
         else:
             logger.warning("--output_type should be equal to 'pil' to save frames in --video_save_dir.")
 

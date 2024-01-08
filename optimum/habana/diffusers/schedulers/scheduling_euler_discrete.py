@@ -72,7 +72,10 @@ class GaudiEulerDiscreteScheduler(EulerDiscreteScheduler):
         prediction_type: str = "epsilon",
         interpolation_type: str = "linear",
         use_karras_sigmas: Optional[bool] = False,
+        sigma_min: Optional[float] = None,
+        sigma_max: Optional[float] = None,
         timestep_spacing: str = "linspace",
+        timestep_type: str = "discrete",  # can be "discrete" or "continuous"
         steps_offset: int = 0,
     ):
         super().__init__(
@@ -84,7 +87,10 @@ class GaudiEulerDiscreteScheduler(EulerDiscreteScheduler):
             prediction_type,
             interpolation_type,
             use_karras_sigmas,
+            sigma_min,
+            sigma_max,
             timestep_spacing,
+            timestep_type,
             steps_offset,
         )
         self._initial_timestep = None

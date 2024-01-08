@@ -119,7 +119,8 @@ class GaudiStableVideoDiffusionPipeline(GaudiDiffusionPipeline):
 
     def _encode_image(self, image, device, num_videos_per_prompt, do_classifier_free_guidance):
         # Adapted from: https://github.com/huggingface/diffusers/blob/v0.24.0-release/src/diffusers/pipelines/stable_video_diffusion/pipeline_stable_video_diffusion.py
-        #     - Support batching by returning image embeddings and negative embeddings separately
+        #     - Support batching by returning unconditional and image embeddings separately
+        #     - Latents are concatenated during batch generation
         dtype = next(self.image_encoder.parameters()).dtype
 
         if not isinstance(image, torch.Tensor):
@@ -155,11 +156,6 @@ class GaudiStableVideoDiffusionPipeline(GaudiDiffusionPipeline):
         if do_classifier_free_guidance:
             negative_image_embeddings = torch.zeros_like(image_embeddings)
 
-            # For classifier free guidance, we need to do two forward passes.
-            # Here we concatenate the unconditional and text embeddings into a single batch
-            # to avoid doing two forward passes
-            # image_embeddings = torch.cat([negative_image_embeddings, image_embeddings])
-
         return image_embeddings, negative_image_embeddings
 
     def _encode_vae_image(
@@ -169,25 +165,21 @@ class GaudiStableVideoDiffusionPipeline(GaudiDiffusionPipeline):
         num_videos_per_prompt,
         do_classifier_free_guidance,
     ):
-        # Adapted from: https://github.com/huggingface/diffusers/blob/v0.24.0-release/src/diffusers/pipelines/stable_video_diffusion/pipeline_stable_video_diffusion.py
-        #     - Support batching by returning image embeddings and negative embeddings separately
         image = image.to(device=device)
         image_latents = self.vae.encode(image).latent_dist.mode()
 
-        negative_image_latents = None
         if do_classifier_free_guidance:
             negative_image_latents = torch.zeros_like(image_latents)
-            negative_image_latents = negative_image_latents.repeat(num_videos_per_prompt, 1, 1, 1)
 
             # For classifier free guidance, we need to do two forward passes.
             # Here we concatenate the unconditional and text embeddings into a single batch
             # to avoid doing two forward passes
-            # image_latents = torch.cat([negative_image_latents, image_latents])
+            image_latents = torch.cat([negative_image_latents, image_latents])
 
         # duplicate image_latents for each generation per prompt, using mps friendly method
         image_latents = image_latents.repeat(num_videos_per_prompt, 1, 1, 1)
 
-        return image_latents, negative_image_latents
+        return image_latents
 
     def _get_add_time_ids(
         self,
@@ -317,19 +309,22 @@ class GaudiStableVideoDiffusionPipeline(GaudiDiffusionPipeline):
             batch_size,
             latents,
             image_latents,
-            negative_image_latents,
             image_embeddings,
             negative_image_embeddings,
             added_time_ids,
-            negative_added_time_ids
+            negative_added_time_ids,
+            do_classifier_free_guidance
     ):
         # Use torch.split to generate num_batches batches of size batch_size
         latents_batches = list(torch.split(latents, batch_size))
-        image_latents_batches = list(torch.split(image_latents, batch_size))
         image_embeddings_batches = list(torch.split(image_embeddings, batch_size))
         added_time_ids_batches = list(torch.split(added_time_ids, batch_size))
-        if negative_image_latents is not None:
-            negative_image_latents_batches = list(torch.split(negative_image_latents, batch_size))
+
+        if do_classifier_free_guidance:
+            image_latents_batches = list(torch.split(image_latents, (batch_size * 2)))
+        else:
+            image_latents_batches = list(torch.split(image_latents, batch_size))
+
         if negative_image_embeddings is not None:
             negative_image_embeddings_batches = list(torch.split(negative_image_embeddings, batch_size))
         if negative_added_time_ids is not None:
@@ -345,17 +340,11 @@ class GaudiStableVideoDiffusionPipeline(GaudiDiffusionPipeline):
             )
             latents_batches[-1] = torch.vstack(sequence_to_stack)
             # Pad image_latents_batches
+            num_latent_dummy_samples = num_dummy_samples * 2 if do_classifier_free_guidance else num_dummy_samples
             sequence_to_stack = (image_latents_batches[-1],) + tuple(
-                torch.zeros_like(image_latents_batches[-1][0][None, :]) for _ in range(num_dummy_samples)
+                torch.zeros_like(image_latents_batches[-1][0][None, :]) for _ in range(num_latent_dummy_samples)
             )
             image_latents_batches[-1] = torch.vstack(sequence_to_stack)
-            # Pad negative_image_latents_batches if necessary
-            if negative_image_latents is not None:
-                # Pad image_latents_batches
-                sequence_to_stack = (negative_image_latents_batches[-1],) + tuple(
-                    torch.zeros_like(negative_image_latents_batches[-1][0][None, :]) for _ in range(num_dummy_samples)
-                )
-                negative_image_latents_batches[-1] = torch.vstack(sequence_to_stack)
             # Pad image_embeddings_batches
             sequence_to_stack = (image_embeddings_batches[-1],) + tuple(
                 torch.zeros_like(image_embeddings_batches[-1][0][None, :]) for _ in range(num_dummy_samples)
@@ -383,20 +372,11 @@ class GaudiStableVideoDiffusionPipeline(GaudiDiffusionPipeline):
 
         # Stack batches in the same tensor
         latents_batches = torch.stack(latents_batches)
-
-        if negative_image_latents is not None:
-            # For classifier free guidance, we need to do two forward passes.
-            # Here we concatenate the unconditional and text embeddings into a single batch
-            # to avoid doing two forward passes
-            for i, (negative_image_latents_batch, image_latents_batch) in enumerate(
-                    zip(negative_image_latents_batches, image_latents_batches[:])
-            ):
-                image_latents_batches[i] = torch.cat([negative_image_latents_batch, image_latents_batch])
         image_latents_batches = torch.stack(image_latents_batches)
 
         if negative_image_embeddings is not None:
             # For classifier free guidance, we need to do two forward passes.
-            # Here we concatenate the unconditional and text embeddings into a single batch
+            # Here we concatenate the unconditional and image embeddings into a single batch
             # to avoid doing two forward passes
             for i, (negative_image_embeddings_batch, image_embeddings_batch) in enumerate(
                     zip(negative_image_embeddings_batches, image_embeddings_batches[:])
@@ -404,9 +384,9 @@ class GaudiStableVideoDiffusionPipeline(GaudiDiffusionPipeline):
                 image_embeddings_batches[i] = torch.cat([negative_image_embeddings_batch, image_embeddings_batch])
         image_embeddings_batches = torch.stack(image_embeddings_batches)
 
-        if negative_image_embeddings is not None:
+        if negative_added_time_ids is not None:
             # For classifier free guidance, we need to do two forward passes.
-            # Here we concatenate the unconditional and text embeddings into a single batch
+            # Here we concatenate the unconditional and time ids into a single batch
             # to avoid doing two forward passes
             for i, (negative_added_time_ids_batch, added_time_ids_batch) in enumerate(
                     zip(negative_added_time_ids_batches, added_time_ids_batches[:])
@@ -570,7 +550,7 @@ class GaudiStableVideoDiffusionPipeline(GaudiDiffusionPipeline):
         if needs_upcasting:
             self.vae.to(dtype=torch.float32)
 
-        image_latents, negative_image_latents = self._encode_vae_image(
+        image_latents = self._encode_vae_image(
             image,
             device,
             num_videos_per_prompt,
@@ -585,9 +565,6 @@ class GaudiStableVideoDiffusionPipeline(GaudiDiffusionPipeline):
         # Repeat the image latents for each frame so we can concatenate them with the noise
         # image_latents [batch, channels, height, width] ->[batch, num_frames, channels, height, width]
         image_latents = image_latents.unsqueeze(1).repeat(1, num_frames, 1, 1, 1)
-        if negative_image_latents is not None:
-            negative_image_latents = negative_image_latents.to(image_embeddings.dtype)
-            negative_image_latents = negative_image_latents.unsqueeze(1).repeat(1, num_frames, 1, 1, 1)
 
         # 5. Get Added Time IDs
         added_time_ids, negative_added_time_ids = self._get_add_time_ids(
@@ -606,6 +583,7 @@ class GaudiStableVideoDiffusionPipeline(GaudiDiffusionPipeline):
         # 4. Prepare timesteps
         self.scheduler.set_timesteps(num_inference_steps, device=device)
         timesteps = self.scheduler.timesteps
+        self.scheduler.reset_timestep_dependent_params()
 
         # 5. Prepare latent variables
         num_channels_latents = self.unet.config.in_channels
@@ -624,7 +602,7 @@ class GaudiStableVideoDiffusionPipeline(GaudiDiffusionPipeline):
         # 7. Prepare guidance scale
         guidance_scale = torch.linspace(min_guidance_scale, max_guidance_scale, num_frames).unsqueeze(0)
         guidance_scale = guidance_scale.to(device, latents.dtype)
-        guidance_scale = guidance_scale.repeat(num_images * num_videos_per_prompt, 1) # TODO: change to batch size?
+        guidance_scale = guidance_scale.repeat(batch_size, 1) # TODO: change to batch size?
         guidance_scale = _append_dims(guidance_scale, latents.ndim)
 
         self._guidance_scale = guidance_scale
@@ -634,11 +612,11 @@ class GaudiStableVideoDiffusionPipeline(GaudiDiffusionPipeline):
             batch_size,
             latents,
             image_latents,
-            negative_image_latents,
             image_embeddings,
             negative_image_embeddings,
             added_time_ids,
-            negative_added_time_ids
+            negative_added_time_ids,
+            do_classifier_free_guidance
         )
 
         outputs = {
@@ -701,16 +679,16 @@ class GaudiStableVideoDiffusionPipeline(GaudiDiffusionPipeline):
 
                     latents_batch = callback_outputs.pop("latents", latents_batch)
 
-                if not output_type == "latent":
-                    # cast back to fp16 if needed
-                    if needs_upcasting:
-                        self.vae.to(dtype=torch.float16)
-                    frames = self.decode_latents(latents_batch, num_frames, decode_chunk_size)
-                    frames = tensor2vid(frames, self.image_processor, output_type=output_type)
-                else:
-                    frames = latents_batch
+            if not output_type == "latent":
+                # cast back to fp16 if needed
+                if needs_upcasting:
+                    self.vae.to(dtype=torch.float16)
+                frames = self.decode_latents(latents_batch, num_frames, decode_chunk_size)
+                frames = tensor2vid(frames, self.image_processor, output_type=output_type)
+            else:
+                frames = latents_batch
 
-                outputs["frames"].append(frames)
+            outputs["frames"].append(frames)
 
         speed_metrics_prefix = "generation"
         speed_measures = speed_metrics(
