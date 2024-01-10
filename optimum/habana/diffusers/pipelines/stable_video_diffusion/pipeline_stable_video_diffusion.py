@@ -118,9 +118,6 @@ class GaudiStableVideoDiffusionPipeline(GaudiDiffusionPipeline):
         self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor)
 
     def _encode_image(self, image, device, num_videos_per_prompt, do_classifier_free_guidance):
-        # Adapted from: https://github.com/huggingface/diffusers/blob/v0.24.0-release/src/diffusers/pipelines/stable_video_diffusion/pipeline_stable_video_diffusion.py
-        #     - Support batching by returning unconditional and image embeddings separately
-        #     - Latents are concatenated during batch generation
         dtype = next(self.image_encoder.parameters()).dtype
 
         if not isinstance(image, torch.Tensor):
@@ -152,11 +149,15 @@ class GaudiStableVideoDiffusionPipeline(GaudiDiffusionPipeline):
         image_embeddings = image_embeddings.repeat(1, num_videos_per_prompt, 1)
         image_embeddings = image_embeddings.view(bs_embed * num_videos_per_prompt, seq_len, -1)
 
-        negative_image_embeddings = None
         if do_classifier_free_guidance:
             negative_image_embeddings = torch.zeros_like(image_embeddings)
 
-        return image_embeddings, negative_image_embeddings
+            # For classifier free guidance, we need to do two forward passes.
+            # Here we concatenate the unconditional and text embeddings into a single batch
+            # to avoid doing two forward passes
+            image_embeddings = torch.cat([negative_image_embeddings, image_embeddings])
+
+        return image_embeddings
 
     def _encode_vae_image(
         self,
@@ -191,8 +192,6 @@ class GaudiStableVideoDiffusionPipeline(GaudiDiffusionPipeline):
         num_videos_per_prompt,
         do_classifier_free_guidance,
     ):
-        # Adapted from: https://github.com/huggingface/diffusers/blob/v0.24.0-release/src/diffusers/pipelines/stable_video_diffusion/pipeline_stable_video_diffusion.py
-        #     - Support batching by returning image embeddings and negative embeddings separately
         add_time_ids = [fps, motion_bucket_id, noise_aug_strength]
 
         passed_add_embed_dim = self.unet.config.addition_time_embed_dim * len(add_time_ids)
@@ -206,11 +205,10 @@ class GaudiStableVideoDiffusionPipeline(GaudiDiffusionPipeline):
         add_time_ids = torch.tensor([add_time_ids], dtype=dtype)
         add_time_ids = add_time_ids.repeat(batch_size * num_videos_per_prompt, 1)
 
-        negative_add_time_ids = None
         if do_classifier_free_guidance:
-            negative_add_time_ids = add_time_ids
+            add_time_ids = torch.cat([add_time_ids, add_time_ids])
 
-        return add_time_ids, negative_add_time_ids
+        return add_time_ids
 
     def decode_latents(self, latents, num_frames, decode_chunk_size=14):
         # [batch, frames, channels, height, width] -> [batch*frames, channels, height, width]
@@ -304,95 +302,111 @@ class GaudiStableVideoDiffusionPipeline(GaudiDiffusionPipeline):
         return self._num_timesteps
 
     @classmethod
+    def _pad_batches(
+            cls,
+            input_batches,
+            num_dummy_samples
+    ):
+        sequence_to_stack = (input_batches[-1],) + tuple(
+            torch.zeros_like(input_batches[-1][0][None, :]) for _ in range(num_dummy_samples)
+        )
+        input_batches[-1] = torch.vstack(sequence_to_stack)
+        return input_batches
+
+    @classmethod
+    def _split_input_into_batches(
+            cls,
+            cond_input,
+            batch_size,
+            num_dummy_samples,
+            uncond_input=None,
+    ):
+        input_batches = list(torch.split(cond_input, batch_size))
+        uncond_input_batches = None
+        if uncond_input is not None:
+            uncond_input_batches = list(torch.split(uncond_input, batch_size))
+
+        if num_dummy_samples > 0:  # Pad inputs
+            input_batches = cls._pad_batches(input_batches, num_dummy_samples)
+            if uncond_input_batches is not None:
+                uncond_input_batches = cls._pad_batches(uncond_input_batches, num_dummy_samples)
+
+        if uncond_input_batches is not None:
+            # For classifier free guidance, we need to do two forward passes.
+            # Here we concatenate the unconditional and conditional inputs into a single batch
+            # to avoid doing two forward passes
+            for i, (uncond_input_batch, input_batch) in enumerate(
+                    zip(uncond_input_batches, input_batches[:])
+            ):
+                input_batches[i] = torch.cat([uncond_input_batch, input_batch])
+        input_batches = torch.stack(input_batches)
+        return input_batches
+
+    @classmethod
+    def _split_image_latents_into_batches(
+            cls,
+            image_latents,
+            batch_size,
+            num_dummy_samples,
+            num_images,
+            do_classifier_free_guidance,
+    ):
+        if do_classifier_free_guidance:
+            # Tiling of unconditional and conditional image latents differs from image embeddings
+            # For image latents, first concatenate the unconditional and conditional image latents
+            # Next, repeat for number of videos per prompt
+            negative_image_latents = torch.zeros_like(image_latents)
+            image_latents_batches = list(torch.split(image_latents, batch_size))
+            negative_image_latents_batches = list(torch.split(negative_image_latents, batch_size))
+            if num_dummy_samples > 0:  # Pad inputs
+                image_latents_batches = cls._pad_batches(image_latents_batches, num_dummy_samples)
+                negative_image_latents_batches = cls._pad_batches(negative_image_latents_batches, num_dummy_samples)
+            for i, (negative_image_latents_batch, image_latents_batch) in enumerate(
+                    zip(negative_image_latents_batches, image_latents_batches[:])
+            ):
+                uncond_splits = list(torch.split(negative_image_latents_batch, num_images))
+                cond_splits = list(torch.split(image_latents_batch, num_images))
+                input_batch = [torch.cat([uncond, cond]) for (uncond, cond) in zip(uncond_splits, cond_splits)]
+                image_latents_batches[i] = torch.vstack(input_batch)
+            image_latents_batches = torch.stack(image_latents_batches)
+        else:
+            image_latents_batches = cls._split_input_into_batches(image_latents, batch_size, num_dummy_samples)
+
+        return image_latents_batches
+
+    @classmethod
     def _split_inputs_into_batches(
             cls,
             batch_size,
             latents,
             image_latents,
             image_embeddings,
-            negative_image_embeddings,
             added_time_ids,
-            negative_added_time_ids,
+            num_images,
             do_classifier_free_guidance
     ):
-        # Use torch.split to generate num_batches batches of size batch_size
-        latents_batches = list(torch.split(latents, batch_size))
-        image_embeddings_batches = list(torch.split(image_embeddings, batch_size))
-        added_time_ids_batches = list(torch.split(added_time_ids, batch_size))
-
         if do_classifier_free_guidance:
-            image_latents_batches = list(torch.split(image_latents, (batch_size * 2)))
+            negative_image_embeddings, image_embeddings = image_embeddings.chunk(2)
+            negative_added_time_ids, added_time_ids = added_time_ids.chunk(2)
         else:
-            image_latents_batches = list(torch.split(image_latents, batch_size))
+            negative_image_embeddings = None
+            negative_added_time_ids = None
 
-        if negative_image_embeddings is not None:
-            negative_image_embeddings_batches = list(torch.split(negative_image_embeddings, batch_size))
-        if negative_added_time_ids is not None:
-            negative_added_time_ids_batches = list(torch.split(negative_added_time_ids, batch_size))
+        # If the last batch has less samples than batch_size, compute number of dummy samples to pad
+        last_samples = latents.shape[0] % batch_size
+        num_dummy_samples = batch_size - last_samples if last_samples > 0 else 0
 
-        # If the last batch has less samples than batch_size, pad it with dummy samples
-        num_dummy_samples = 0
-        if latents_batches[-1].shape[0] < batch_size:
-            num_dummy_samples = batch_size - latents_batches[-1].shape[0]
-            # Pad latents_batches
-            sequence_to_stack = (latents_batches[-1],) + tuple(
-                torch.zeros_like(latents_batches[-1][0][None, :]) for _ in range(num_dummy_samples)
-            )
-            latents_batches[-1] = torch.vstack(sequence_to_stack)
-            # Pad image_latents_batches
-            num_latent_dummy_samples = num_dummy_samples * 2 if do_classifier_free_guidance else num_dummy_samples
-            sequence_to_stack = (image_latents_batches[-1],) + tuple(
-                torch.zeros_like(image_latents_batches[-1][0][None, :]) for _ in range(num_latent_dummy_samples)
-            )
-            image_latents_batches[-1] = torch.vstack(sequence_to_stack)
-            # Pad image_embeddings_batches
-            sequence_to_stack = (image_embeddings_batches[-1],) + tuple(
-                torch.zeros_like(image_embeddings_batches[-1][0][None, :]) for _ in range(num_dummy_samples)
-            )
-            image_embeddings_batches[-1] = torch.vstack(sequence_to_stack)
-            # Pad negative_image_embeddings_batches if necessary
-            if negative_image_embeddings is not None:
-                # Pad image_latents_batches
-                sequence_to_stack = (negative_image_embeddings_batches[-1],) + tuple(
-                    torch.zeros_like(negative_image_embeddings_batches[-1][0][None, :]) for _ in range(num_dummy_samples)
-                )
-                negative_image_embeddings_batches[-1] = torch.vstack(sequence_to_stack)
-            # Pad added_time_ids_batches
-            sequence_to_stack = (added_time_ids_batches[-1],) + tuple(
-                torch.zeros_like(added_time_ids_batches[-1][0][None, :]) for _ in range(num_dummy_samples)
-            )
-            added_time_ids_batches[-1] = torch.vstack(sequence_to_stack)
-            # Pad negative_image_embeddings_batches if necessary
-            if negative_added_time_ids is not None:
-                # Pad image_latents_batches
-                sequence_to_stack = (negative_added_time_ids_batches[-1],) + tuple(
-                    torch.zeros_like(negative_added_time_ids_batches[-1][0][None, :]) for _ in range(num_dummy_samples)
-                )
-                negative_added_time_ids_batches[-1] = torch.vstack(sequence_to_stack)
-
-        # Stack batches in the same tensor
-        latents_batches = torch.stack(latents_batches)
-        image_latents_batches = torch.stack(image_latents_batches)
-
-        if negative_image_embeddings is not None:
-            # For classifier free guidance, we need to do two forward passes.
-            # Here we concatenate the unconditional and image embeddings into a single batch
-            # to avoid doing two forward passes
-            for i, (negative_image_embeddings_batch, image_embeddings_batch) in enumerate(
-                    zip(negative_image_embeddings_batches, image_embeddings_batches[:])
-            ):
-                image_embeddings_batches[i] = torch.cat([negative_image_embeddings_batch, image_embeddings_batch])
-        image_embeddings_batches = torch.stack(image_embeddings_batches)
-
-        if negative_added_time_ids is not None:
-            # For classifier free guidance, we need to do two forward passes.
-            # Here we concatenate the unconditional and time ids into a single batch
-            # to avoid doing two forward passes
-            for i, (negative_added_time_ids_batch, added_time_ids_batch) in enumerate(
-                    zip(negative_added_time_ids_batches, added_time_ids_batches[:])
-            ):
-                added_time_ids_batches[i] = torch.cat([negative_added_time_ids_batch, added_time_ids_batch])
-        added_time_ids_batches = torch.stack(added_time_ids_batches)
+        # Generate num_batches batches of size batch_size
+        latents_batches = cls._split_input_into_batches(latents, batch_size, num_dummy_samples)
+        image_latents_batches = cls._split_image_latents_into_batches(
+            image_latents,
+            batch_size,
+            num_dummy_samples,
+            num_images,
+            do_classifier_free_guidance
+        )
+        image_embeddings_batches = cls._split_input_into_batches(image_embeddings, batch_size, num_dummy_samples, negative_image_embeddings)
+        added_time_ids_batches = cls._split_input_into_batches(added_time_ids, batch_size, num_dummy_samples, negative_added_time_ids)
 
         return latents_batches, image_latents_batches, image_embeddings_batches, added_time_ids_batches, num_dummy_samples
 
@@ -529,7 +543,7 @@ class GaudiStableVideoDiffusionPipeline(GaudiDiffusionPipeline):
         do_classifier_free_guidance = max_guidance_scale > 1.0
 
         # 3. Encode input image
-        image_embeddings, negative_image_embeddings = self._encode_image(
+        image_embeddings = self._encode_image(
             image,
             device,
             num_videos_per_prompt,
@@ -550,11 +564,13 @@ class GaudiStableVideoDiffusionPipeline(GaudiDiffusionPipeline):
         if needs_upcasting:
             self.vae.to(dtype=torch.float32)
 
+        # Only encode the conditional image latents and generate unconditional image latents during batch split
+        # The tiling of conditional and unconditional image latents requires special handling
         image_latents = self._encode_vae_image(
             image,
             device,
             num_videos_per_prompt,
-            do_classifier_free_guidance
+            do_classifier_free_guidance=False # Override to return only conditional latents
         )
         image_latents = image_latents.to(image_embeddings.dtype)
 
@@ -567,7 +583,7 @@ class GaudiStableVideoDiffusionPipeline(GaudiDiffusionPipeline):
         image_latents = image_latents.unsqueeze(1).repeat(1, num_frames, 1, 1, 1)
 
         # 5. Get Added Time IDs
-        added_time_ids, negative_added_time_ids = self._get_add_time_ids(
+        added_time_ids = self._get_add_time_ids(
             fps,
             motion_bucket_id,
             noise_aug_strength,
@@ -577,8 +593,6 @@ class GaudiStableVideoDiffusionPipeline(GaudiDiffusionPipeline):
             do_classifier_free_guidance,
         )
         added_time_ids = added_time_ids.to(device)
-        if negative_added_time_ids is not None:
-            negative_added_time_ids = negative_added_time_ids.to(device)
 
         # 4. Prepare timesteps
         self.scheduler.set_timesteps(num_inference_steps, device=device)
@@ -613,9 +627,8 @@ class GaudiStableVideoDiffusionPipeline(GaudiDiffusionPipeline):
             latents,
             image_latents,
             image_embeddings,
-            negative_image_embeddings,
             added_time_ids,
-            negative_added_time_ids,
+            num_images,
             do_classifier_free_guidance
         )
 
