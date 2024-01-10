@@ -616,7 +616,7 @@ class GaudiStableVideoDiffusionPipeline(GaudiDiffusionPipeline):
         # 7. Prepare guidance scale
         guidance_scale = torch.linspace(min_guidance_scale, max_guidance_scale, num_frames).unsqueeze(0)
         guidance_scale = guidance_scale.to(device, latents.dtype)
-        guidance_scale = guidance_scale.repeat(batch_size, 1) # TODO: change to batch size?
+        guidance_scale = guidance_scale.repeat(batch_size, 1)
         guidance_scale = _append_dims(guidance_scale, latents.ndim)
 
         self._guidance_scale = guidance_scale

@@ -899,12 +899,9 @@ class GaudiStableVideoDiffusionPipelineTester(TestCase):
         self.assertEqual(len(outputs), num_videos_per_prompt)
         self.assertEqual(image.shape, (2, 3, 32, 32))
         # output of diffusers cpu model for 3 video generations (i.e., batch size)
-        # this output is identical for batch size=3
+        # Using batch size instead of total video generations for expected output
+        # because classifier-free model output changes based on number of generations
         expected_slice = np.array([0.5899, 0.5799, 0.5515, 0.6655, 0.6219, 0.6437, 0.5732, 0.5227, 0.5328])
-        # output of diffusers cpu model for 9 video generations (i.e., total videos)
-        # the output of model changes based on number of generations
-        # this output is within 1e-02
-        # expected_slice = np.array([0.5877, 0.5823, 0.5585, 0.6662, 0.6258, 0.6459, 0.5753, 0.5325, 0.5387])
 
         self.assertLess(np.abs(image_slice.flatten() - expected_slice).max(), 1e-2)
 
@@ -924,12 +921,7 @@ class GaudiStableVideoDiffusionPipelineTester(TestCase):
         self.assertEqual(image.shape, (2, 3, 32, 32))
 
         # output of diffusers cpu model for 3 video generations (i.e., batch size)
-        # this output is identical for batch size=3
         expected_slice = np.array([0.5899, 0.5799, 0.5515, 0.6655, 0.6219, 0.6437, 0.5732, 0.5227, 0.5328])
-        # output of diffusers cpu model for 7 video generations (i.e., total videos)
-        # the output of model changes based on number of generations
-        # this output is within 1e-02
-        # expected_slice = np.array([0.5946, 0.5807, 0.5518, 0.6601, 0.6246, 0.6469, 0.5651, 0.5270, 0.5334])
 
         self.assertLess(np.abs(image_slice.flatten() - expected_slice).max(), 1e-2)
 
@@ -971,13 +963,8 @@ class GaudiStableVideoDiffusionPipelineTester(TestCase):
         self.assertEqual(len(outputs), num_images * num_videos_per_prompt)
         self.assertEqual(image.shape, (2, 3, 32, 32))
 
-        # output of diffusers cpu model for 3 imput images with 1 video per prompt
-        # this output is identical for batch size=3
+        # output of diffusers cpu model for 3 input images with 1 video per prompt
         expected_slice = np.array([0.5026, 0.5873, 0.5591, 0.6236, 0.6200, 0.6158, 0.5214, 0.5603, 0.5245])
-        # the output of model changes based on number of generations
-        # this output is within 2e-02
-        # expected_slice = np.array([0.5135, 0.5769, 0.5805, 0.6354, 0.6215, 0.6266, 0.5182, 0.5513, 0.5291])
 
-        # TODO: Determine expected input
         self.assertLess(np.abs(image_slice.flatten() - expected_slice).max(), 1e-2)
 
