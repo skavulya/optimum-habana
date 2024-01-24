@@ -36,9 +36,10 @@ from transformers.testing_utils import parse_flag_from_env, slow
 from optimum.habana import GaudiConfig
 from optimum.habana.diffusers import (
     GaudiDDIMScheduler,
-    GaudiDiffusionPipeline,
     GaudiEulerAncestralDiscreteScheduler,
     GaudiEulerDiscreteScheduler,
+    GaudiLCMScheduler,
+    GaudiDiffusionPipeline,
     GaudiStableDiffusionLDM3DPipeline,
     GaudiStableDiffusionPipeline,
     GaudiStableDiffusionUpscalePipeline,
@@ -245,6 +246,58 @@ class GaudiStableDiffusionPipelineTester(TestCase):
 
         self.assertEqual(image.shape, (64, 64, 3))
         expected_slice = np.array([0.3203, 0.4555, 0.4711, 0.3505, 0.3973, 0.4650, 0.5137, 0.3392, 0.4045])
+
+        self.assertLess(np.abs(image_slice.flatten() - expected_slice).max(), 1e-2)
+
+    def test_stable_diffusion_lcm(self):
+        device = "cpu"
+
+        components = self.get_dummy_components(time_cond_proj_dim=256)
+        gaudi_config = GaudiConfig(use_torch_autocast=False)
+
+        sd_pipe = GaudiStableDiffusionPipeline(
+            use_habana=True,
+            gaudi_config=gaudi_config,
+            **components,
+        )
+        sd_pipe.scheduler = GaudiLCMScheduler.from_config(sd_pipe.scheduler.config)
+        sd_pipe.set_progress_bar_config(disable=None)
+
+        inputs = self.get_dummy_inputs(device)
+        output = sd_pipe(**inputs)
+        image = output.images[0]
+
+        image_slice = image[-3:, -3:, -1]
+
+        self.assertEqual(image.shape, (64, 64, 3))
+        expected_slice = np.array([0.3454, 0.5349, 0.5185, 0.2808, 0.4509, 0.4612, 0.4655, 0.3601, 0.4315])
+
+        self.assertLess(np.abs(image_slice.flatten() - expected_slice).max(), 1e-2)
+
+    def test_stable_diffusion_lcm_custom_timesteps(self):
+        device = "cpu"
+
+        components = self.get_dummy_components(time_cond_proj_dim=256)
+        gaudi_config = GaudiConfig(use_torch_autocast=False)
+
+        sd_pipe = GaudiStableDiffusionPipeline(
+            use_habana=True,
+            gaudi_config=gaudi_config,
+            **components,
+        )
+        sd_pipe.scheduler = GaudiLCMScheduler.from_config(sd_pipe.scheduler.config)
+        sd_pipe.set_progress_bar_config(disable=None)
+
+        inputs = self.get_dummy_inputs(device)
+        del inputs["num_inference_steps"]
+        inputs["timesteps"] = [999, 499]
+        output = sd_pipe(**inputs)
+        image = output.images[0]
+
+        image_slice = image[-3:, -3:, -1]
+
+        self.assertEqual(image.shape, (64, 64, 3))
+        expected_slice = np.array([0.3454, 0.5349, 0.5185, 0.2808, 0.4509, 0.4612, 0.4655, 0.3601, 0.4315])
 
         self.assertLess(np.abs(image_slice.flatten() - expected_slice).max(), 1e-2)
 
@@ -947,6 +1000,48 @@ class GaudiStableDiffusionXLPipelineTester(TestCase):
         self.assertEqual(image.shape, (64, 64, 3))
         expected_slice = np.array([0.4675, 0.5173, 0.4611, 0.4067, 0.5250, 0.4674, 0.5446, 0.5094, 0.4791])
         self.assertLess(np.abs(image_slice.flatten() - expected_slice).max(), 1e-2)
+
+    def test_stable_diffusion_xl_lcm(self):
+        device = "cpu"  # ensure determinism for the device-dependent torch.Generator
+        components = self.get_dummy_components(time_cond_proj_dim=256)
+        gaudi_config = GaudiConfig(use_torch_autocast=False)
+        sd_pipe = GaudiStableDiffusionXLPipeline(use_habana=True, gaudi_config=gaudi_config, **components)
+        sd_pipe.scheduler = GaudiLCMScheduler.from_config(sd_pipe.scheduler.config)
+        sd_pipe = sd_pipe.to(device)
+        sd_pipe.set_progress_bar_config(disable=None)
+
+        inputs = self.get_dummy_inputs(device)
+        image = sd_pipe(**inputs).images[0]
+
+        image_slice = image[-3:, -3:, -1]
+
+        self.assertEqual(image.shape, (64, 64, 3))
+
+        expected_slice = np.array([0.4917, 0.6555, 0.4348, 0.5219, 0.7324, 0.4855, 0.5168, 0.5447, 0.5156])
+
+        assert np.abs(image_slice.flatten() - expected_slice).max() < 1e-2
+
+    def test_stable_diffusion_xl_lcm_custom_timesteps(self):
+        device = "cpu"  # ensure determinism for the device-dependent torch.Generator
+        components = self.get_dummy_components(time_cond_proj_dim=256)
+        gaudi_config = GaudiConfig(use_torch_autocast=False)
+        sd_pipe = GaudiStableDiffusionXLPipeline(use_habana=True, gaudi_config=gaudi_config, **components)
+        sd_pipe.scheduler = GaudiLCMScheduler.from_config(sd_pipe.scheduler.config)
+        sd_pipe = sd_pipe.to(device)
+        sd_pipe.set_progress_bar_config(disable=None)
+
+        inputs = self.get_dummy_inputs(device)
+        del inputs["num_inference_steps"]
+        inputs["timesteps"] = [999, 499]
+        image = sd_pipe(**inputs).images[0]
+
+        image_slice = image[-3:, -3:, -1]
+
+        self.assertEqual(image.shape, (64, 64, 3))
+
+        expected_slice = np.array([0.4917, 0.6555, 0.4348, 0.5219, 0.7324, 0.4855, 0.5168, 0.5447, 0.5156])
+
+        assert np.abs(image_slice.flatten() - expected_slice).max() < 1e-2
 
     def test_stable_diffusion_xl_turbo_euler_ancestral(self):
         device = "cpu"  # ensure determinism for the device-dependent torch.Generator

@@ -456,7 +456,7 @@ class GaudiStableDiffusionPipeline(GaudiDiffusionPipeline, StableDiffusionPipeli
             timestep_cond = None
             if self.unet.config.time_cond_proj_dim is not None:
                 guidance_scale_tensor = torch.tensor(self.guidance_scale - 1).repeat(
-                    batch_size * num_images_per_prompt
+                    batch_size
                 )
                 timestep_cond = self.get_guidance_scale_embedding(
                     guidance_scale_tensor, embedding_dim=self.unet.config.time_cond_proj_dim
@@ -627,7 +627,15 @@ class GaudiStableDiffusionPipeline(GaudiDiffusionPipeline, StableDiffusionPipeli
         capture,
     ):
         if self.use_hpu_graphs:
-            return self.capture_replay(latent_model_input, timestep, encoder_hidden_states, capture)
+            return self.capture_replay(
+                latent_model_input,
+                timestep,
+                encoder_hidden_states,
+                timestep_cond,
+                cross_attention_kwargs,
+                added_cond_kwargs,
+                capture
+            )
         else:
             return self.unet(
                 latent_model_input,
@@ -640,8 +648,16 @@ class GaudiStableDiffusionPipeline(GaudiDiffusionPipeline, StableDiffusionPipeli
             )[0]
 
     @torch.no_grad()
-    def capture_replay(self, latent_model_input, timestep, encoder_hidden_states, capture):
-        inputs = [latent_model_input, timestep, encoder_hidden_states, False]
+    def capture_replay(self, latent_model_input, timestep, encoder_hidden_states, timestep_cond,
+                       cross_attention_kwargs, added_cond_kwargs, capture):
+        inputs = [
+            latent_model_input,
+            timestep,
+            encoder_hidden_states,
+            timestep_cond,
+            cross_attention_kwargs,
+            added_cond_kwargs,
+        ]
         h = self.ht.hpu.graphs.input_hash(inputs)
         cached = self.cache.get(h)
 
@@ -650,7 +666,15 @@ class GaudiStableDiffusionPipeline(GaudiDiffusionPipeline, StableDiffusionPipeli
             with self.ht.hpu.stream(self.hpu_stream):
                 graph = self.ht.hpu.HPUGraph()
                 graph.capture_begin()
-                outputs = self.unet(inputs[0], inputs[1], inputs[2], inputs[3])[0]
+                outputs = self.unet(
+                    sample=inputs[0],
+                    timestep=inputs[1],
+                    encoder_hidden_states=inputs[2],
+                    timestep_cond=inputs[3],
+                    cross_attention_kwargs=inputs[4],
+                    added_cond_kwargs=inputs[5],
+                    return_dict=False,
+                )[0]
                 graph.capture_end()
                 graph_inputs = inputs
                 graph_outputs = outputs

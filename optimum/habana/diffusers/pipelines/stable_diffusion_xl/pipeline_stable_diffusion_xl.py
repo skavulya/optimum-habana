@@ -673,7 +673,7 @@ class GaudiStableDiffusionXLPipeline(GaudiDiffusionPipeline, StableDiffusionXLPi
             timestep_cond = None
             if self.unet.config.time_cond_proj_dim is not None:
                 guidance_scale_tensor = torch.tensor(self.guidance_scale - 1).repeat(
-                    num_prompts * num_images_per_prompt
+                    batch_size
                 )
                 timestep_cond = self.get_guidance_scale_embedding(
                     guidance_scale_tensor, embedding_dim=self.unet.config.time_cond_proj_dim
