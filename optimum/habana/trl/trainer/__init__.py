@@ -19,3 +19,4 @@
 
 from .sft_trainer import GaudiSFTTrainer
 from .dpo_trainer import GaudiDPOTrainer
+from .ddpo_trainer import GaudiDDPOTrainer

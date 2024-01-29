@@ -34,6 +34,8 @@ INSTALL_REQUIRES = [
     "torch",
     "accelerate >= 0.23.0",
     "diffusers >= 0.18.0, < 0.24.0",
+    "trl",
+    "peft < 0.7.0",
 ]
 
 TESTS_REQUIRE = [
