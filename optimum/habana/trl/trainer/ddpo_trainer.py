@@ -204,7 +204,7 @@ class GaudiDDPOTrainer(DDPOTrainer, GaudiTrainer):
 
         GaudiTrainer.__init__(
             self,
-            sd_pipeline=sd_pipeline,
+            model=sd_pipeline,
             args=args,
             gaudi_config=gaudi_config,
         )
