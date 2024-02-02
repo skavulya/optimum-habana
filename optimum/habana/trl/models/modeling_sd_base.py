@@ -37,6 +37,12 @@ if is_peft_available():
     from peft import LoraConfig
     from peft.utils import get_peft_model_state_dict
 
+from optimum.habana import GaudiConfig
+from optimum.habana.diffusers import (
+    GaudiDDIMScheduler,
+    GaudiStableDiffusionPipeline,
+)
+
 
 def _get_variance(self, timestep, prev_timestep):
     alpha_prod_t = torch.gather(self.alphas_cumprod, 0, timestep.cpu()).to(timestep.device)
@@ -400,15 +406,46 @@ def pipeline_step(
 class GaudiDefaultDDPOStableDiffusionPipeline(DefaultDDPOStableDiffusionPipeline):
     def __init__(self, pretrained_model_name: str,
                  *, pretrained_model_revision: str = "main",
-                 use_lora: bool = True):
-        self.sd_pipeline = StableDiffusionPipeline.from_pretrained(
-            pretrained_model_name, revision=pretrained_model_revision
+                 use_lora: bool = True,
+                 use_habana: bool = False,
+                 use_hpu_graphs: bool = False,
+                 gaudi_config: Union[str, GaudiConfig] = None,
+                 bf16_full_eval: bool = False,
+                 ):
+        """
+        pretrained_model_name (str):
+            Name of pretrained model.
+        pretrained_model_revision (str):
+            Revision of pretrained model.
+        use_lora (bool, defaults to `True`):
+            Whether to use LoRA finetuning or not.
+        use_habana (bool, defaults to `False`):
+            Whether to use Gaudi (`True`) or CPU (`False`).
+        use_hpu_graphs (bool, defaults to `False`):
+            Whether to use HPU graphs or not.
+        gaudi_config (Union[str, [`GaudiConfig`]], defaults to `None`):
+            Gaudi configuration to use. Can be a string to download it from the Hub.
+           Or a previously initialized config can be passed.
+        bf16_full_eval (bool, defaults to `False`):
+            Whether to use full bfloat16 evaluation instead of 32-bit.
+            This will be faster and save memory compared to fp32/mixed precision but can harm generated images.
+        """
+        self.sd_pipeline = GaudiStableDiffusionPipeline.from_pretrained(
+            pretrained_model_name,
+            revision=pretrained_model_revision,
+            use_habana=use_habana,
+            use_hpu_graphs=use_hpu_graphs,
+            gaudi_config=gaudi_config,
+            bf16_full_eval=bf16_full_eval
         )
 
         self.use_lora = use_lora
         self.pretrained_model = pretrained_model_name
         self.pretrained_revision = pretrained_model_revision
-
+        self.use_habana = use_habana
+        self.use_hpu_graphs = use_hpu_graphs
+        self.gaudi_config = gaudi_config
+        self.bf16_full_eval = bf16_full_eval
         try:
             self.sd_pipeline.load_lora_weights(
                 pretrained_model_name,
@@ -423,7 +460,7 @@ class GaudiDefaultDDPOStableDiffusionPipeline(DefaultDDPOStableDiffusionPipeline
                     "Otherwise please check the if `pytorch_lora_weights.safetensors` exists in the model folder."
                 )
 
-        self.sd_pipeline.scheduler = DDIMScheduler.from_config(self.sd_pipeline.scheduler.config)
+        self.sd_pipeline.scheduler = GaudiDDIMScheduler.from_config(self.sd_pipeline.scheduler.config)
         self.sd_pipeline.safety_checker = None
 
         # memory optimization

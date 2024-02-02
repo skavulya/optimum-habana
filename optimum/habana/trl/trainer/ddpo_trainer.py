@@ -30,6 +30,7 @@ from trl.trainer import BaseTrainer, DDPOConfig
 from trl.trainer.utils import PerPromptStatTracker
 from trl import DDPOTrainer
 from optimum.habana import GaudiConfig, GaudiTrainer, GaudiTrainingArguments
+from optimum.habana.accelerate import GaudiAccelerator
 
 logger = get_logger(__name__)
 
@@ -53,7 +54,7 @@ This is a diffusion model that has been fine-tuned with reinforcement learning t
 """
 
 
-class GaudiDDPOTrainer(DDPOTrainer, GaudiTrainer):
+class GaudiDDPOTrainer(DDPOTrainer):
     """
     The DDPOTrainer uses Deep Diffusion Policy Optimization to optimise diffusion models.
     Note, this trainer is heavily inspired by the work here: https://github.com/kvablack/ddpo-pytorch
@@ -77,13 +78,12 @@ class GaudiDDPOTrainer(DDPOTrainer, GaudiTrainer):
         prompt_function: Callable[[], Tuple[str, Any]],
         sd_pipeline: DDPOStableDiffusionPipeline,
         image_samples_hook: Optional[Callable[[Any, Any, Any], Any]] = None,
-        args: GaudiTrainingArguments = None,
         gaudi_config: GaudiConfig = None,
+        use_habana: bool = True,  # TODO: Delete once pipeline supported on HPU
     ):
         """
         Copied from DDPOTrainer.__init__: https://https://github.com/huggingface/trl/blob/main/trl/trainer/ddpo_trainer.py#L55
         The only differences are:
-        - add GaudiTrainingArguments
         - add new args gaudi_config
         - use graph for ref_model
         - use GaudiTrainer instead of BaseTrainer
@@ -121,10 +121,10 @@ class GaudiDDPOTrainer(DDPOTrainer, GaudiTrainer):
         # number of timesteps within each trajectory to train on
         self.num_train_timesteps = int(self.config.sample_num_steps * self.config.train_timestep_fraction)
 
-        self.accelerator = Accelerator(
-            log_with=self.config.log_with,
+        self.accelerator = GaudiAccelerator(
             mixed_precision=self.config.mixed_precision,
             project_config=accelerator_project_config,
+            cpu = (not use_habana),
             # we always accumulate gradients across timesteps; we want config.train.gradient_accumulation_steps to be the
             # number of *samples* we accumulate across, so we need to multiply by the number of training timesteps to get
             # the total number of optimizer steps to accumulate across.
@@ -201,13 +201,6 @@ class GaudiDDPOTrainer(DDPOTrainer, GaudiTrainer):
                 config.per_prompt_stat_tracking_buffer_size,
                 config.per_prompt_stat_tracking_min_count,
             )
-
-        GaudiTrainer.__init__(
-            self,
-            model=sd_pipeline,
-            args=args,
-            gaudi_config=gaudi_config,
-        )
 
         # NOTE: for some reason, autocast is necessary for non-lora training but for lora training it isn't necessary and it uses
         # more memory
