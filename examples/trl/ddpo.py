@@ -70,6 +70,10 @@ class ScriptArguments:
         default=True,
         metadata={"help": "Whether or not to use HPU."}
     )
+    hpu_graph:  bool = field(
+        default=False,
+        metadata={"help": "Whether or not to use HPU Graph."}
+    )
 
 
 class MLP(nn.Module):
@@ -231,7 +235,8 @@ if __name__ == "__main__":
         pipeline,
         image_samples_hook=None,  # TODO: Enable once you enable trackers - image_outputs_logger,
         gaudi_config=gaudi_config,
-        use_habana=args.use_habana
+        use_habana=args.use_habana,
+        hpu_graph=args.hpu_graph
     )
 
     trainer.train()

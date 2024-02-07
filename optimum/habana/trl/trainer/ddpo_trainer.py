@@ -80,6 +80,7 @@ class GaudiDDPOTrainer(DDPOTrainer):
         image_samples_hook: Optional[Callable[[Any, Any, Any], Any]] = None,
         gaudi_config: GaudiConfig = None,
         use_habana: bool = True,  # TODO: Delete once pipeline supported on HPU
+        hpu_graph: bool = False,
     ):
         """
         Copied from DDPOTrainer.__init__: https://https://github.com/huggingface/trl/blob/main/trl/trainer/ddpo_trainer.py#L55
@@ -212,10 +213,11 @@ class GaudiDDPOTrainer(DDPOTrainer):
         else:
             self.trainable_layers, self.optimizer = self.accelerator.prepare(trainable_layers, self.optimizer)
 
-            from habana_frameworks.torch.hpu import wrap_in_hpu_graph  # use graph for ref_model
+            if hpu_graph:
+                from habana_frameworks.torch.hpu import wrap_in_hpu_graph  # use graph for ref_model
 
-            trainable_layers = self.accelerator.unwrap_model(self.trainable_layers)
-            trainable_layers = wrap_in_hpu_graph(trainable_layers)
+                trainable_layers = self.accelerator.unwrap_model(self.trainable_layers)
+                trainable_layers = wrap_in_hpu_graph(trainable_layers)
 
         if self.config.async_reward_computation:
             self.executor = futures.ThreadPoolExecutor(max_workers=config.max_workers)
