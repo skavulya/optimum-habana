@@ -115,3 +115,182 @@ python text_to_image_generation.py \
 > - use [the latest checkpoint](https://huggingface.co/Intel/ldm3d-4c) for generating improved results
 > - use [the pano checkpoint](https://huggingface.co/Intel/ldm3d-pano) to generate panoramic view
 
+### Stable Diffusion XL (SDXL)
+
+Stable Diffusion XL was proposed in [SDXL: Improving Latent Diffusion Models for High-Resolution Image Synthesis](https://arxiv.org/pdf/2307.01952.pdf) by the Stability AI team.
+
+Here is how to generate SDXL images with a single prompt:
+```python
+python text_to_image_generation.py \
+    --model_name_or_path stabilityai/stable-diffusion-xl-base-1.0 \
+    --prompts "Sailing ship painting by Van Gogh" \
+    --num_images_per_prompt 20 \
+    --batch_size 4 \
+    --image_save_dir /tmp/stable_diffusion_xl_images \
+    --scheduler euler_discrete \
+    --use_habana \
+    --use_hpu_graphs \
+    --gaudi_config Habana/stable-diffusion \
+    --bf16    
+```
+
+> HPU graphs are recommended when generating images by batches to get the fastest possible generations.
+> The first batch of images entails a performance penalty. All subsequent batches will be generated much faster.
+> You can enable this mode with `--use_hpu_graphs`.
+
+Here is how to generate SDXL images with several prompts:
+```python
+python text_to_image_generation.py \
+    --model_name_or_path stabilityai/stable-diffusion-xl-base-1.0 \
+    --prompts "Sailing ship painting by Van Gogh" "A shiny flying horse taking off" \
+    --num_images_per_prompt 20 \
+    --batch_size 8 \
+    --image_save_dir /tmp/stable_diffusion_xl_images \
+    --scheduler euler_discrete \
+    --use_habana \
+    --use_hpu_graphs \
+    --gaudi_config Habana/stable-diffusion \
+    --bf16
+```
+
+SDXL combines a second text encoder (OpenCLIP ViT-bigG/14) with the original text encoder to significantly
+increase the number of parameters. Here is how to generate images with several prompts for both `prompt`
+and `prompt_2` (2nd text encoder), as well as their negative prompts:
+```python
+python text_to_image_generation.py \
+    --model_name_or_path stabilityai/stable-diffusion-xl-base-1.0 \
+    --prompts "Sailing ship painting by Van Gogh" "A shiny flying horse taking off" \
+    --prompts_2 "Red tone" "Blue tone" \
+    --negative_prompts "Low quality" "Sketch" \
+    --negative_prompts_2 "Clouds" "Clouds" \
+    --num_images_per_prompt 20 \
+    --batch_size 8 \
+    --image_save_dir /tmp/stable_diffusion_xl_images \
+    --scheduler euler_discrete \
+    --use_habana \
+    --use_hpu_graphs \
+    --gaudi_config Habana/stable-diffusion \
+    --bf16
+```
+
+> HPU graphs are recommended when generating images by batches to get the fastest possible generations.
+> The first batch of images entails a performance penalty. All subsequent batches will be generated much faster.
+> You can enable this mode with `--use_hpu_graphs`.
+
+### SDXL-Turbo
+SDXL-Turbo is a distilled version of SDXL 1.0, trained for real-time synthesis.
+
+Here is how to generate images with multiple prompts:
+```bash
+python text_to_image_generation.py \
+    --model_name_or_path stabilityai/sdxl-turbo \
+    --prompts "Sailing ship painting by Van Gogh" "A shiny flying horse taking off" \
+    --num_images_per_prompt 20 \
+    --batch_size 8 \
+    --image_save_dir /tmp/stable_diffusion_xl_turbo_images \
+    --scheduler euler_ancestral_discrete \
+    --use_habana \
+    --use_hpu_graphs \
+    --gaudi_config Habana/stable-diffusion \
+    --bf16
+```
+
+> HPU graphs are recommended when generating images by batches to get the fastest possible generations.
+> The first batch of images entails a performance penalty. All subsequent batches will be generated much faster.
+> You can enable this mode with `--use_hpu_graphs`.
+
+
+## Textual Inversion
+
+[Textual Inversion](https://arxiv.org/abs/2208.01618) is a method to personalize text2image models like Stable Diffusion on your own images using just 3-5 examples.
+The `textual_inversion.py` script shows how to implement the training procedure on Habana Gaudi.
+
+
+### Cat toy example
+
+Let's get our dataset. For this example, we will use some cat images: https://huggingface.co/datasets/diffusers/cat_toy_example .
+
+Let's first download it locally:
+
+```py
+from huggingface_hub import snapshot_download
+
+local_dir = "./cat"
+snapshot_download("diffusers/cat_toy_example", local_dir=local_dir, repo_type="dataset", ignore_patterns=".gitattributes")
+```
+
+This will be our training data.
+Now we can launch the training using:
+
+```bash
+python textual_inversion.py \
+  --pretrained_model_name_or_path runwayml/stable-diffusion-v1-5 \
+  --train_data_dir ./cat \
+  --learnable_property object \
+  --placeholder_token "<cat-toy>" \
+  --initializer_token toy \
+  --resolution 512 \
+  --train_batch_size 4 \
+  --max_train_steps 3000 \
+  --learning_rate 5.0e-04 \
+  --scale_lr \
+  --lr_scheduler constant \
+  --lr_warmup_steps 0 \
+  --output_dir /tmp/textual_inversion_cat \
+  --save_as_full_pipeline \
+  --gaudi_config_name Habana/stable-diffusion \
+  --throughput_warmup_steps 3
+```
+
+> Change `--resolution` to 768 if you are using the [stable-diffusion-2](https://huggingface.co/stabilityai/stable-diffusion-2) 768x768 model.
+
+> As described in [the official paper](https://arxiv.org/abs/2208.01618), only one embedding vector is used for the placeholder token, *e.g.* `"<cat-toy>"`. However, one can also add multiple embedding vectors for the placeholder token to increase the number of fine-tuneable parameters. This can help the model to learn more complex details. To use multiple embedding vectors, you can define `--num_vectors` to a number larger than one, *e.g.*: `--num_vectors 5`. The saved textual inversion vectors will then be larger in size compared to the default case.
+
+
+### Multi-card Run
+
+You can run this fine-tuning script in a distributed fashion as follows:
+```bash
+python ../gaudi_spawn.py --use_mpi --world_size 8 textual_inversion.py \
+  --pretrained_model_name_or_path runwayml/stable-diffusion-v1-5 \
+  --train_data_dir ./cat \
+  --learnable_property object \
+  --placeholder_token '"<cat-toy>"' \
+  --initializer_token toy \
+  --resolution 512 \
+  --train_batch_size 4 \
+  --max_train_steps 375 \
+  --learning_rate 5.0e-04 \
+  --scale_lr \
+  --lr_scheduler constant \
+  --lr_warmup_steps 0 \
+  --output_dir /tmp/textual_inversion_cat \
+  --save_as_full_pipeline \
+  --gaudi_config_name Habana/stable-diffusion \
+  --throughput_warmup_steps 3
+```
+
+
+### Inference
+
+Once you have trained a model as described right above, inference can be done simply using the `GaudiStableDiffusionPipeline`. Make sure to include the `placeholder_token` in your prompt.
+
+```python
+import torch
+from optimum.habana.diffusers import GaudiStableDiffusionPipeline
+
+model_id = "path-to-your-trained-model"
+pipe = GaudiStableDiffusionPipeline.from_pretrained(
+  model_id,
+  torch_dtype=torch.bfloat16,
+  use_habana=True,
+  use_hpu_graphs=True,
+  gaudi_config="Habana/stable-diffusion",
+)
+
+prompt = "A <cat-toy> backpack"
+
+image = pipe(prompt, num_inference_steps=50, guidance_scale=7.5).images[0]
+
+image.save("cat-backpack.png")
+```

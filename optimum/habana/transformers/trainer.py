@@ -15,6 +15,7 @@
 
 import contextlib
 import copy
+import inspect
 import math
 import os
 import random
@@ -119,6 +120,10 @@ if TYPE_CHECKING:
     import optuna
 
 
+def _is_peft_model(model):
+    return is_peft_available() and isinstance(model, PeftModel)
+
+
 logger = logging.get_logger(__name__)
 
 
@@ -209,7 +214,7 @@ class GaudiTrainer(Trainer):
                     )
 
             if self.use_hpu_amp and "LOWER_LIST" not in os.environ:
-                gaudi_config.declare_autocast_bf16_fp32_ops()
+                self.gaudi_config.declare_autocast_bf16_fp32_ops()
 
             if self.args.use_lazy_mode:
                 try:
@@ -422,6 +427,11 @@ class GaudiTrainer(Trainer):
         args = self.args
 
         self.is_in_train = True
+
+        # do_train is not a reliable argument, as it might not be set and .train() still called, so
+        # the following is a workaround:
+        if (args.fp16_full_eval or args.bf16_full_eval) and not args.do_train:
+            self._move_model_to_device(self.model, args.device)
 
         if "model_path" in kwargs:
             resume_from_checkpoint = kwargs.pop("model_path")
@@ -1016,7 +1026,7 @@ class GaudiTrainer(Trainer):
             or os.path.exists(best_safe_adapter_model_path)
         ):
             has_been_loaded = True
-            if is_peft_available() and isinstance(model, PeftModel):
+            if _is_peft_model(model):
                 # If train a model using PEFT & LoRA, assume that adapter have been saved properly.
                 if hasattr(model, "active_adapter") and hasattr(model, "load_adapter"):
                     if os.path.exists(best_adapter_model_path) or os.path.exists(best_safe_adapter_model_path):
@@ -1155,14 +1165,19 @@ class GaudiTrainer(Trainer):
 
         if self.hp_search_backend is None and trial is None:
             self.store_flos()
-
         run_dir = self._get_output_dir(trial=trial)
         output_dir = os.path.join(run_dir, checkpoint_folder)
         self.save_model(output_dir, _internal_call=True)
         if self.is_deepspeed_enabled:
             # under zero3 model file itself doesn't get saved since it's bogus! Unless deepspeed
             # config `stage3_gather_16bit_weights_on_model_save` is True
-            self.model_wrapped.save_checkpoint(output_dir)
+            accept_exclude_frozen_parameters = "exclude_frozen_parameters" in set(
+                inspect.signature(self.model_wrapped.save_checkpoint).parameters.keys()
+            )
+            if accept_exclude_frozen_parameters and _is_peft_model(self.model):
+                self.model_wrapped.save_checkpoint(output_dir, exclude_frozen_parameters=True)
+            else:
+                self.model_wrapped.save_checkpoint(output_dir)
 
         # Save optimizer and scheduler
         if self.args.should_save and not self.is_deepspeed_enabled:
@@ -1396,7 +1411,13 @@ class GaudiTrainer(Trainer):
                     self._save(output_dir, state_dict={})
                 # remove the dummy state_dict
                 remove_dummy_checkpoint(self.args.should_save, output_dir, [WEIGHTS_NAME, SAFE_WEIGHTS_NAME])
-                self.model_wrapped.save_checkpoint(output_dir)
+                accept_exclude_frozen_parameters = "exclude_frozen_parameters" in set(
+                    inspect.signature(self.model_wrapped.save_checkpoint).parameters.keys()
+                )
+                if accept_exclude_frozen_parameters and _is_peft_model(self.model):
+                    self.model_wrapped.save_checkpoint(output_dir, exclude_frozen_parameters=True)
+                else:
+                    self.model_wrapped.save_checkpoint(output_dir)
         elif self.args.should_save:
             self._save(output_dir)
 
@@ -1493,6 +1514,14 @@ class GaudiTrainer(Trainer):
                     model, disable_tensor_cache=args.disable_tensor_cache_hpu_graphs, max_graphs=args.max_hpu_graphs
                 )
                 self.already_wrapped_for_hpu_graphs = True
+
+        # if full fp16 or bf16 eval is wanted and this ``evaluation`` or ``predict`` isn't called
+        # while ``train`` is running, cast it to the right dtype first and then put on device
+        if not self.is_in_train:
+            if args.fp16_full_eval:
+                model = model.to(dtype=torch.float16, device=args.device)
+            elif args.bf16_full_eval:
+                model = model.to(dtype=torch.bfloat16, device=args.device)
 
         batch_size = self.args.eval_batch_size
 
@@ -1886,6 +1915,14 @@ class GaudiTrainer(Trainer):
                     model, disable_tensor_cache=args.disable_tensor_cache_hpu_graphs, max_graphs=args.max_hpu_graphs
                 )
                 self.already_wrapped_for_hpu_graphs = True
+
+        # if full fp16 or bf16 eval is wanted and this ``evaluation`` or ``predict`` isn't called
+        # while ``train`` is running, cast it to the right dtype first and then put on device
+        if not self.is_in_train:
+            if args.fp16_full_eval:
+                model = model.to(dtype=torch.float16, device=args.device)
+            elif args.bf16_full_eval:
+                model = model.to(dtype=torch.bfloat16, device=args.device)
 
         batch_size = dataloader.batch_size
         num_examples = self.num_examples(dataloader)
