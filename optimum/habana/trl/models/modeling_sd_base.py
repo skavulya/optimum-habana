@@ -186,7 +186,7 @@ def scheduler_step(
     log_prob = (
         -((prev_sample.detach() - prev_sample_mean) ** 2) / (2 * (std_dev_t**2))
         - torch.log(std_dev_t)
-        - torch.log(torch.sqrt(2 * torch.as_tensor(np.pi)))
+        - torch.log(torch.sqrt(2 * torch.as_tensor(np.pi, device=model_output.device)))
     )
     # mean along all but batch dimension
     log_prob = log_prob.mean(dim=tuple(range(1, log_prob.ndim)))
@@ -344,20 +344,32 @@ def pipeline_step(
     num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
     all_latents = [latents]
     all_log_probs = []
+    # Optionally get Guidance Scale Embedding
+    timestep_cond = None
+    if self.unet.config.time_cond_proj_dim is not None:
+        guidance_scale_tensor = torch.tensor(self.guidance_scale - 1).repeat(
+            batch_size * num_images_per_prompt
+        )
+        timestep_cond = self.get_guidance_scale_embedding(
+            guidance_scale_tensor, embedding_dim=self.unet.config.time_cond_proj_dim
+        ).to(device=device, dtype=latents.dtype)
+
     with self.progress_bar(total=num_inference_steps) as progress_bar:
         for i, t in enumerate(timesteps):
             # expand the latents if we are doing classifier free guidance
             latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
             latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
 
+            capture = True if self.use_hpu_graphs and i < 2 else False
             # predict the noise residual
-            noise_pred = self.unet(
-                latent_model_input,
-                t,
-                encoder_hidden_states=prompt_embeds,
-                cross_attention_kwargs=cross_attention_kwargs,
-                return_dict=False,
-            )[0]
+            noise_pred = self.unet_hpu(
+                        latent_model_input,
+                        t,
+                        prompt_embeds,
+                        timestep_cond,
+                        cross_attention_kwargs,
+                        capture,
+                    )
 
             # perform guidance
             if do_classifier_free_guidance:
@@ -402,6 +414,21 @@ def pipeline_step(
 
     return DDPOPipelineOutput(image, all_latents, all_log_probs)
 
+    @torch.no_grad()
+    def unet_hpu(
+        self, latent_model_input, timestep, encoder_hidden_states, timestep_cond, cross_attention_kwargs, capture
+    ):
+        if self.use_hpu_graphs:
+            return self.capture_replay(latent_model_input, timestep, encoder_hidden_states, capture)
+        else:
+            return self.unet(
+                latent_model_input,
+                timestep,
+                encoder_hidden_states=encoder_hidden_states,
+                timestep_cond=timestep_cond,
+                cross_attention_kwargs=cross_attention_kwargs,
+                return_dict=False,
+            )[0]
 
 class GaudiDefaultDDPOStableDiffusionPipeline(DefaultDDPOStableDiffusionPipeline):
     def __init__(self, pretrained_model_name: str,
