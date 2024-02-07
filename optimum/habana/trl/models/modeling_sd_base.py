@@ -414,21 +414,6 @@ def pipeline_step(
 
     return DDPOPipelineOutput(image, all_latents, all_log_probs)
 
-    @torch.no_grad()
-    def unet_hpu(
-        self, latent_model_input, timestep, encoder_hidden_states, timestep_cond, cross_attention_kwargs, capture
-    ):
-        if self.use_hpu_graphs:
-            return self.capture_replay(latent_model_input, timestep, encoder_hidden_states, capture)
-        else:
-            return self.unet(
-                latent_model_input,
-                timestep,
-                encoder_hidden_states=encoder_hidden_states,
-                timestep_cond=timestep_cond,
-                cross_attention_kwargs=cross_attention_kwargs,
-                return_dict=False,
-            )[0]
 
 class GaudiDefaultDDPOStableDiffusionPipeline(DefaultDDPOStableDiffusionPipeline):
     def __init__(self, pretrained_model_name: str,

@@ -70,6 +70,10 @@ class ScriptArguments:
         default=True,
         metadata={"help": "Whether or not to use HPU."}
     )
+    use_hpu_graphs:  bool = field(
+        default=False,
+        metadata={"help": "Whether or not to use hpu graphs."}
+    )
 
 
 class MLP(nn.Module):
@@ -196,6 +200,7 @@ def image_outputs_logger(image_data, global_step, accelerate_logger):
 
 
 if __name__ == "__main__":
+
     parser = HfArgumentParser((ScriptArguments, DDPOConfig))
     args, ddpo_config = parser.parse_args_into_dataclasses()
     ddpo_config.mixed_precision = "bf16"
@@ -217,6 +222,7 @@ if __name__ == "__main__":
         pretrained_model_revision=args.pretrained_revision,
         use_lora=args.use_lora,
         use_habana=args.use_habana,
+        use_hpu_graphs=args.use_hpu_graphs,
         gaudi_config=gaudi_config,
     )
 
