@@ -360,7 +360,7 @@ def pipeline_step(
             latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
             latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
 
-            capture = True if self.use_hpu_graphs and i < 2 else False
+            capture = True if False and i < 2 else False
             # predict the noise residual
             noise_pred = self.unet_hpu(
                         latent_model_input,
@@ -414,21 +414,21 @@ def pipeline_step(
 
     return DDPOPipelineOutput(image, all_latents, all_log_probs)
 
-    @torch.no_grad()
-    def unet_hpu(
-        self, latent_model_input, timestep, encoder_hidden_states, timestep_cond, cross_attention_kwargs, capture
-    ):
-        if self.use_hpu_graphs:
-            return self.capture_replay(latent_model_input, timestep, encoder_hidden_states, capture)
-        else:
-            return self.unet(
-                latent_model_input,
-                timestep,
-                encoder_hidden_states=encoder_hidden_states,
-                timestep_cond=timestep_cond,
-                cross_attention_kwargs=cross_attention_kwargs,
-                return_dict=False,
-            )[0]
+    # @torch.no_grad()
+    # def unet_hpu(
+    #     self, latent_model_input, timestep, encoder_hidden_states, timestep_cond, cross_attention_kwargs, capture
+    # ):
+    #     if self.use_hpu_graphs:
+    #         return self.capture_replay(latent_model_input, timestep, encoder_hidden_states, capture)
+    #     else:
+    #         return self.unet(
+    #             latent_model_input,
+    #             timestep,
+    #             encoder_hidden_states=encoder_hidden_states,
+    #             timestep_cond=timestep_cond,
+    #             cross_attention_kwargs=cross_attention_kwargs,
+    #             return_dict=False,
+    #         )[0]
 
 class GaudiDefaultDDPOStableDiffusionPipeline(DefaultDDPOStableDiffusionPipeline):
     def __init__(self, pretrained_model_name: str,

@@ -80,7 +80,7 @@ class GaudiDDPOTrainer(DDPOTrainer):
         image_samples_hook: Optional[Callable[[Any, Any, Any], Any]] = None,
         gaudi_config: GaudiConfig = None,
         use_habana: bool = True,  # TODO: Delete once pipeline supported on HPU
-        use_hpu_graphs: bool = True,
+        use_hpu_graphs: bool = False,
     ):
         """
         Copied from DDPOTrainer.__init__: https://https://github.com/huggingface/trl/blob/main/trl/trainer/ddpo_trainer.py#L55

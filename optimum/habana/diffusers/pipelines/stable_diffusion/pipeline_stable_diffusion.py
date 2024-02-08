@@ -550,7 +550,7 @@ class GaudiStableDiffusionPipeline(GaudiDiffusionPipeline, StableDiffusionPipeli
     def unet_hpu(
         self, latent_model_input, timestep, encoder_hidden_states, timestep_cond, cross_attention_kwargs, capture
     ):
-        if self.use_hpu_graphs:
+        if False:
             return self.capture_replay(latent_model_input, timestep, encoder_hidden_states, capture)
         else:
             return self.unet(
