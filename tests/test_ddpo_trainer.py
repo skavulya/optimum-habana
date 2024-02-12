@@ -16,15 +16,10 @@ import unittest
 
 import torch
 
-from trl import is_diffusers_available, is_peft_available
+from optimum.habana import GaudiConfig
+from trl import DDPOConfig
+from optimum.habana.trl import GaudiDDPOTrainer, GaudiDefaultDDPOStableDiffusionPipeline
 
-from .testing_utils import require_diffusers
-
-
-if is_diffusers_available() and is_peft_available():
-    from trl import DDPOConfig, DDPOTrainer, DefaultDDPOStableDiffusionPipeline
-
-from optimum.habana import GaudiDDPOTrainer
 
 def scorer_function(images, prompts, metadata):
     return torch.randn(1) * 3.0, {}
@@ -34,7 +29,6 @@ def prompt_function():
     return ("cabbages", {})
 
 
-@require_diffusers
 class GaudiDDPOTrainerTester(unittest.TestCase):
     """
     Test the GaudiDDPOTrainer class.
@@ -53,11 +47,25 @@ class GaudiDDPOTrainerTester(unittest.TestCase):
         pretrained_model = "hf-internal-testing/tiny-stable-diffusion-torch"
         pretrained_revision = "main"
 
-        pipeline = DefaultDDPOStableDiffusionPipeline(
-            pretrained_model, pretrained_model_revision=pretrained_revision, use_lora=False
+        gaudi_config = GaudiConfig()
+        pipeline = GaudiDefaultDDPOStableDiffusionPipeline(
+            pretrained_model,
+            pretrained_model_revision=pretrained_revision,
+            use_lora=False,
+            gaudi_config=gaudi_config,
+            use_habana=True,
+            use_hpu_graphs=False
         )
 
-        self.trainer = GaudiDDPOTrainer(self.ddpo_config, scorer_function, prompt_function, pipeline)
+        self.trainer = GaudiDDPOTrainer(
+            self.ddpo_config,
+            scorer_function,
+            prompt_function,
+            pipeline,
+            gaudi_config=gaudi_config,
+            use_habana=True,
+            use_hpu_graphs=False
+        )
 
         return super().setUp()
 
@@ -100,7 +108,6 @@ class GaudiDDPOTrainerTester(unittest.TestCase):
         assert torch.isfinite(loss.cpu())
 
 
-@require_diffusers
 class GaudiDDPOTrainerWithLoRATester(GaudiDDPOTrainerTester):
     """
     Test the GaudiDDPOTrainer class.
@@ -119,7 +126,7 @@ class GaudiDDPOTrainerWithLoRATester(GaudiDDPOTrainerTester):
         pretrained_model = "hf-internal-testing/tiny-stable-diffusion-torch"
         pretrained_revision = "main"
 
-        pipeline = DefaultDDPOStableDiffusionPipeline(
+        pipeline = GaudiDefaultDDPOStableDiffusionPipeline(
             pretrained_model, pretrained_model_revision=pretrained_revision, use_lora=True
         )
 

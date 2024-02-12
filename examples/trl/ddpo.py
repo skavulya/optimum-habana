@@ -188,6 +188,8 @@ def image_outputs_logger(image_data, global_step, accelerate_logger):
     images, prompts, _, rewards, _ = image_data[-1]
 
     for i, image in enumerate(images):
+        if image.dtype == torch.bfloat16:
+            image = image.float()  # bf16 not supported by numpy
         prompt = prompts[i]
         reward = rewards[i].item()
         result[f"{prompt:.25} | {reward:.2f}"] = image.unsqueeze(0)
@@ -233,7 +235,7 @@ if __name__ == "__main__":
         ),
         prompt_fn,
         pipeline,
-        image_samples_hook=None,  # TODO: Enable once you enable trackers - image_outputs_logger,
+        image_samples_hook=image_outputs_logger,
         gaudi_config=gaudi_config,
         use_habana=args.use_habana,
         use_hpu_graphs=args.use_hpu_graphs,

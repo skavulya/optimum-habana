@@ -324,8 +324,9 @@ def pipeline_step(
     )
 
     # 4. Prepare timesteps
-    self.scheduler.set_timesteps(num_inference_steps, device=device)
-    timesteps = self.scheduler.timesteps
+    self.scheduler.set_timesteps(num_inference_steps, device="cpu")
+    timesteps = self.scheduler.timesteps.to(self.device)
+    self.scheduler.reset_timestep_dependent_params()
 
     # 5. Prepare latent variables
     num_channels_latents = self.unet.config.in_channels
@@ -355,7 +356,11 @@ def pipeline_step(
         ).to(device=device, dtype=latents.dtype)
 
     with self.progress_bar(total=num_inference_steps) as progress_bar:
-        for i, t in enumerate(timesteps):
+        #for i, t in enumerate(timesteps):
+        for i in range(num_inference_steps):
+            t = timesteps[0]
+            timesteps = torch.roll(timesteps, shifts=-1, dims=0)
+
             # expand the latents if we are doing classifier free guidance
             latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
             latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
@@ -382,6 +387,9 @@ def pipeline_step(
 
             # compute the previous noisy sample x_t -> x_t-1
             scheduler_output = scheduler_step(self.scheduler, noise_pred, t, latents, eta)
+            if self.use_habana and not self.use_hpu_graphs:
+                self.htcore.mark_step()
+
             latents = scheduler_output.latents
             log_prob = scheduler_output.log_probs
 
@@ -400,6 +408,9 @@ def pipeline_step(
     else:
         image = latents
         has_nsfw_concept = None
+
+    if self.use_habana and not self.use_hpu_graphs:
+        self.htcore.mark_step()
 
     if has_nsfw_concept is None:
         do_denormalize = [True] * image.shape[0]
@@ -429,6 +440,7 @@ def pipeline_step(
     #             cross_attention_kwargs=cross_attention_kwargs,
     #             return_dict=False,
     #         )[0]
+
 
 class GaudiDefaultDDPOStableDiffusionPipeline(DefaultDDPOStableDiffusionPipeline):
     def __init__(self, pretrained_model_name: str,
