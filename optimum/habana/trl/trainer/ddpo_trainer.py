@@ -22,7 +22,7 @@ from warnings import warn
 import torch
 from accelerate import Accelerator
 from accelerate.logging import get_logger
-from accelerate.utils import ProjectConfiguration, set_seed
+from accelerate.utils import ProjectConfiguration, DistributedDataParallelKwargs, set_seed
 from huggingface_hub import whoami
 
 from trl.models import DDPOStableDiffusionPipeline
@@ -96,6 +96,7 @@ class GaudiDDPOTrainer(DDPOTrainer):
         self.reward_fn = reward_function
         self.config = config
         self.image_samples_callback = image_samples_hook
+        self.use_hpu_graphs = use_hpu_graphs
 
         accelerator_project_config = ProjectConfiguration(**self.config.project_kwargs)
 
@@ -121,11 +122,13 @@ class GaudiDDPOTrainer(DDPOTrainer):
 
         # number of timesteps within each trajectory to train on
         self.num_train_timesteps = int(self.config.sample_num_steps * self.config.train_timestep_fraction)
-
+        kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
         self.accelerator = GaudiAccelerator(
+            log_with=self.config.log_with,
             mixed_precision=self.config.mixed_precision,
             project_config=accelerator_project_config,
             cpu = (not use_habana),
+            kwargs_handlers=[kwargs],
             # we always accumulate gradients across timesteps; we want config.train.gradient_accumulation_steps to be the
             # number of *samples* we accumulate across, so we need to multiply by the number of training timesteps to get
             # the total number of optimizer steps to accumulate across.
@@ -213,10 +216,11 @@ class GaudiDDPOTrainer(DDPOTrainer):
         else:
             self.trainable_layers, self.optimizer = self.accelerator.prepare(trainable_layers, self.optimizer)
 
-            from habana_frameworks.torch.hpu import wrap_in_hpu_graph  # use graph for ref_model
+            if use_hpu_graphs:
+                from habana_frameworks.torch.hpu import wrap_in_hpu_graph  # use graph for ref_model
 
-            trainable_layers = self.accelerator.unwrap_model(self.trainable_layers)
-            trainable_layers = wrap_in_hpu_graph(trainable_layers)
+                trainable_layers = self.accelerator.unwrap_model(self.trainable_layers)
+                trainable_layers = wrap_in_hpu_graph(trainable_layers)
 
         if self.config.async_reward_computation:
             self.executor = futures.ThreadPoolExecutor(max_workers=config.max_workers)
@@ -248,179 +252,187 @@ class GaudiDDPOTrainer(DDPOTrainer):
 
     #     return zip(*rewards)
 
-    # def step(self, epoch: int, global_step: int):
-    #     """
-    #     Perform a single step of training.
+    def step(self, epoch: int, global_step: int):
+        """
+        Perform a single step of training.
 
-    #     Args:
-    #         epoch (int): The current epoch.
-    #         global_step (int): The current global step.
+        Args:
+            epoch (int): The current epoch.
+            global_step (int): The current global step.
 
-    #     Side Effects:
-    #         - Model weights are updated
-    #         - Logs the statistics to the accelerator trackers.
-    #         - If `self.image_samples_callback` is not None, it will be called with the prompt_image_pairs, global_step, and the accelerator tracker.
+        Side Effects:
+            - Model weights are updated
+            - Logs the statistics to the accelerator trackers.
+            - If `self.image_samples_callback` is not None, it will be called with the prompt_image_pairs, global_step, and the accelerator tracker.
 
-    #     Returns:
-    #         global_step (int): The updated global step.
+        Returns:
+            global_step (int): The updated global step.
 
-    #     """
-    #     samples, prompt_image_data = self._generate_samples(
-    #         iterations=self.config.sample_num_batches_per_epoch,
-    #         batch_size=self.config.sample_batch_size,
-    #     )
+        """
+        samples, prompt_image_data = self._generate_samples(
+            iterations=self.config.sample_num_batches_per_epoch,
+            batch_size=self.config.sample_batch_size,
+        )
 
-    #     # collate samples into dict where each entry has shape (num_batches_per_epoch * sample.batch_size, ...)
-    #     samples = {k: torch.cat([s[k] for s in samples]) for k in samples[0].keys()}
-    #     rewards, rewards_metadata = self.compute_rewards(
-    #         prompt_image_data, is_async=self.config.async_reward_computation
-    #     )
+        # collate samples into dict where each entry has shape (num_batches_per_epoch * sample.batch_size, ...)
+        # Workaround: concatenating int64 tensors is causing overflows. Casting to int32.
+        # Issue affects prompt_ids and timesteps
+        # Original code below :
+        # samples = {k: torch.cat([s[k] for s in samples]) for k in samples[0].keys()}
+        samples = {
+            k: torch.cat([
+                s[k] if s[k].dtype != torch.int64 else s[k].int() for s in samples]) for k in samples[0].keys()
+        }
 
-    #     for i, image_data in enumerate(prompt_image_data):
-    #         image_data.extend([rewards[i], rewards_metadata[i]])
+        rewards, rewards_metadata = self.compute_rewards(
+            prompt_image_data, is_async=self.config.async_reward_computation
+        )
 
-    #     if self.image_samples_callback is not None:
-    #         self.image_samples_callback(prompt_image_data, global_step, self.accelerator.trackers[0])
+        for i, image_data in enumerate(prompt_image_data):
+            image_data.extend([rewards[i], rewards_metadata[i]])
 
-    #     rewards = torch.cat(rewards)
-    #     rewards = self.accelerator.gather(rewards).cpu().numpy()
+        if self.image_samples_callback is not None:
+            self.image_samples_callback(prompt_image_data, global_step, self.accelerator.trackers[0])
 
-    #     self.accelerator.log(
-    #         {
-    #             "reward": rewards,
-    #             "epoch": epoch,
-    #             "reward_mean": rewards.mean(),
-    #             "reward_std": rewards.std(),
-    #         },
-    #         step=global_step,
-    #     )
+        rewards = torch.cat(rewards)
+        rewards = self.accelerator.gather(rewards).cpu().numpy()
 
-    #     if self.config.per_prompt_stat_tracking:
-    #         # gather the prompts across processes
-    #         prompt_ids = self.accelerator.gather(samples["prompt_ids"]).cpu().numpy()
-    #         prompts = self.sd_pipeline.tokenizer.batch_decode(prompt_ids, skip_special_tokens=True)
-    #         advantages = self.stat_tracker.update(prompts, rewards)
-    #     else:
-    #         advantages = (rewards - rewards.mean()) / (rewards.std() + 1e-8)
+        self.accelerator.log(
+            {
+                "reward": rewards,
+                "epoch": epoch,
+                "reward_mean": rewards.mean(),
+                "reward_std": rewards.std(),
+            },
+            step=global_step,
+        )
 
-    #     # ungather advantages;  keep the entries corresponding to the samples on this process
-    #     samples["advantages"] = (
-    #         torch.as_tensor(advantages)
-    #         .reshape(self.accelerator.num_processes, -1)[self.accelerator.process_index]
-    #         .to(self.accelerator.device)
-    #     )
+        if self.config.per_prompt_stat_tracking:
+            # gather the prompts across processes
+            prompt_ids = self.accelerator.gather(samples["prompt_ids"]).cpu().long().numpy() # Workaround for overflow
+            prompts = self.sd_pipeline.tokenizer.batch_decode(prompt_ids, skip_special_tokens=True)
+            advantages = self.stat_tracker.update(prompts, rewards)
+        else:
+            advantages = (rewards - rewards.mean()) / (rewards.std() + 1e-8)
 
-    #     del samples["prompt_ids"]
+        # ungather advantages;  keep the entries corresponding to the samples on this process
+        samples["advantages"] = (
+            torch.as_tensor(advantages)
+            .reshape(self.accelerator.num_processes, -1)[self.accelerator.process_index]
+            .to(self.accelerator.device)
+        )
 
-    #     total_batch_size, num_timesteps = samples["timesteps"].shape
+        del samples["prompt_ids"]
 
-    #     for inner_epoch in range(self.config.train_num_inner_epochs):
-    #         # shuffle samples along batch dimension
-    #         perm = torch.randperm(total_batch_size, device=self.accelerator.device)
-    #         samples = {k: v[perm] for k, v in samples.items()}
+        total_batch_size, num_timesteps = samples["timesteps"].shape
 
-    #         # shuffle along time dimension independently for each sample
-    #         # still trying to understand the code below
-    #         perms = torch.stack(
-    #             [torch.randperm(num_timesteps, device=self.accelerator.device) for _ in range(total_batch_size)]
-    #         )
+        for inner_epoch in range(self.config.train_num_inner_epochs):
+            # shuffle samples along batch dimension
+            perm = torch.randperm(total_batch_size, device=self.accelerator.device)
+            samples = {k: v[perm] for k, v in samples.items()}
 
-    #         for key in ["timesteps", "latents", "next_latents", "log_probs"]:
-    #             samples[key] = samples[key][
-    #                 torch.arange(total_batch_size, device=self.accelerator.device)[:, None],
-    #                 perms,
-    #             ]
+            # shuffle along time dimension independently for each sample
+            # still trying to understand the code below
+            perms = torch.stack(
+                [torch.randperm(num_timesteps, device=self.accelerator.device) for _ in range(total_batch_size)]
+            )
 
-    #         original_keys = samples.keys()
-    #         original_values = samples.values()
-    #         # rebatch them as user defined train_batch_size is different from sample_batch_size
-    #         reshaped_values = [v.reshape(-1, self.config.train_batch_size, *v.shape[1:]) for v in original_values]
+            for key in ["timesteps", "latents", "next_latents", "log_probs"]:
+                samples[key] = samples[key][
+                    torch.arange(total_batch_size, device=self.accelerator.device)[:, None],
+                    perms,
+                ]
 
-    #         # Transpose the list of original values
-    #         transposed_values = zip(*reshaped_values)
-    #         # Create new dictionaries for each row of transposed values
-    #         samples_batched = [dict(zip(original_keys, row_values)) for row_values in transposed_values]
+            original_keys = samples.keys()
+            original_values = samples.values()
+            # rebatch them as user defined train_batch_size is different from sample_batch_size
+            reshaped_values = [v.reshape(-1, self.config.train_batch_size, *v.shape[1:]) for v in original_values]
 
-    #         self.sd_pipeline.unet.train()
-    #         global_step = self._train_batched_samples(inner_epoch, epoch, global_step, samples_batched)
-    #         # ensure optimization step at the end of the inner epoch
-    #         if not self.accelerator.sync_gradients:
-    #             raise ValueError(
-    #                 "Optimization step should have been performed by this point. Please check calculated gradient accumulation settings."
-    #             )
+            # Transpose the list of original values
+            transposed_values = zip(*reshaped_values)
+            # Create new dictionaries for each row of transposed values
+            samples_batched = [dict(zip(original_keys, row_values)) for row_values in transposed_values]
 
-    #     if epoch != 0 and epoch % self.config.save_freq == 0 and self.accelerator.is_main_process:
-    #         self.accelerator.save_state()
+            self.sd_pipeline.unet.train()
+            global_step = self._train_batched_samples(inner_epoch, epoch, global_step, samples_batched)
+            # ensure optimization step at the end of the inner epoch
+            if not self.accelerator.sync_gradients:
+                raise ValueError(
+                    "Optimization step should have been performed by this point. Please check calculated gradient accumulation settings."
+                )
 
-    #     return global_step
+        if epoch != 0 and epoch % self.config.save_freq == 0 and self.accelerator.is_main_process:
+            self.accelerator.save_state()
 
-    # def calculate_loss(self, latents, timesteps, next_latents, log_probs, advantages, embeds):
-    #     """
-    #     Calculate the loss for a batch of an unpacked sample
+        return global_step
 
-    #     Args:
-    #         latents (torch.Tensor):
-    #             The latents sampled from the diffusion model, shape: [batch_size, num_channels_latents, height, width]
-    #         timesteps (torch.Tensor):
-    #             The timesteps sampled from the diffusion model, shape: [batch_size]
-    #         next_latents (torch.Tensor):
-    #             The next latents sampled from the diffusion model, shape: [batch_size, num_channels_latents, height, width]
-    #         log_probs (torch.Tensor):
-    #             The log probabilities of the latents, shape: [batch_size]
-    #         advantages (torch.Tensor):
-    #             The advantages of the latents, shape: [batch_size]
-    #         embeds (torch.Tensor):
-    #             The embeddings of the prompts, shape: [2*batch_size or batch_size, ...]
-    #             Note: the "or" is because if train_cfg is True, the expectation is that negative prompts are concatenated to the embeds
+    def calculate_loss(self, latents, timesteps, next_latents, log_probs, advantages, embeds):
+        """
+        Calculate the loss for a batch of an unpacked sample
 
-    #     Returns:
-    #         loss (torch.Tensor), approx_kl (torch.Tensor), clipfrac (torch.Tensor)
-    #         (all of these are of shape (1,))
-    #     """
-    #     with self.autocast():
-    #         if self.config.train_cfg:
-    #             noise_pred = self.sd_pipeline.unet(
-    #                 torch.cat([latents] * 2),
-    #                 torch.cat([timesteps] * 2),
-    #                 embeds,
-    #             ).sample
-    #             noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-    #             noise_pred = noise_pred_uncond + self.config.sample_guidance_scale * (
-    #                 noise_pred_text - noise_pred_uncond
-    #             )
-    #         else:
-    #             noise_pred = self.sd_pipeline.unet(
-    #                 latents,
-    #                 timesteps,
-    #                 embeds,
-    #             ).sample
-    #         # compute the log prob of next_latents given latents under the current model
+        Args:
+            latents (torch.Tensor):
+                The latents sampled from the diffusion model, shape: [batch_size, num_channels_latents, height, width]
+            timesteps (torch.Tensor):
+                The timesteps sampled from the diffusion model, shape: [batch_size]
+            next_latents (torch.Tensor):
+                The next latents sampled from the diffusion model, shape: [batch_size, num_channels_latents, height, width]
+            log_probs (torch.Tensor):
+                The log probabilities of the latents, shape: [batch_size]
+            advantages (torch.Tensor):
+                The advantages of the latents, shape: [batch_size]
+            embeds (torch.Tensor):
+                The embeddings of the prompts, shape: [2*batch_size or batch_size, ...]
+                Note: the "or" is because if train_cfg is True, the expectation is that negative prompts are concatenated to the embeds
 
-    #         scheduler_step_output = self.sd_pipeline.scheduler_step(
-    #             noise_pred,
-    #             timesteps,
-    #             latents,
-    #             eta=self.config.sample_eta,
-    #             prev_sample=next_latents,
-    #         )
+        Returns:
+            loss (torch.Tensor), approx_kl (torch.Tensor), clipfrac (torch.Tensor)
+            (all of these are of shape (1,))
+        """
+        with self.autocast():
+            if self.config.train_cfg:
+                noise_pred = self.sd_pipeline.unet(
+                    torch.cat([latents] * 2),
+                    torch.cat([timesteps] * 2),
+                    embeds,
+                ).sample
+                noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                noise_pred = noise_pred_uncond + self.config.sample_guidance_scale * (
+                    noise_pred_text - noise_pred_uncond
+                )
+            else:
+                noise_pred = self.sd_pipeline.unet(
+                    latents,
+                    timesteps,
+                    embeds,
+                ).sample
+            # compute the log prob of next_latents given latents under the current model
 
-    #         log_prob = scheduler_step_output.log_probs
+            scheduler_step_output = self.sd_pipeline.scheduler_step(
+                noise_pred,
+                timesteps,
+                latents,
+                eta=self.config.sample_eta,
+                prev_sample=next_latents,
+            )
 
-    #     advantages = torch.clamp(
-    #         advantages,
-    #         -self.config.train_adv_clip_max,
-    #         self.config.train_adv_clip_max,
-    #     )
+            log_prob = scheduler_step_output.log_probs
 
-    #     ratio = torch.exp(log_prob - log_probs)
+        advantages = torch.clamp(
+            advantages,
+            -self.config.train_adv_clip_max,
+            self.config.train_adv_clip_max,
+        )
 
-    #     loss = self.loss(advantages, self.config.train_clip_range, ratio)
+        ratio = torch.exp(log_prob - log_probs)
 
-    #     approx_kl = 0.5 * torch.mean((log_prob - log_probs) ** 2)
+        loss = self.loss(advantages, self.config.train_clip_range, ratio)
 
-    #     clipfrac = torch.mean((torch.abs(ratio - 1.0) > self.config.train_clip_range).float())
+        approx_kl = 0.5 * torch.mean((log_prob - log_probs) ** 2)
 
-    #     return loss, approx_kl, clipfrac
+        clipfrac = torch.mean((torch.abs(ratio - 1.0) > self.config.train_clip_range).float())
+
+        return loss, approx_kl, clipfrac
 
     # def loss(
     #     self,
@@ -460,128 +472,133 @@ class GaudiDDPOTrainer(DDPOTrainer):
     #     self.sd_pipeline.load_checkpoint(models, input_dir)
     #     models.pop()  # ensures that accelerate doesn't try to handle loading of the model
 
-    # def _generate_samples(self, iterations, batch_size):
-    #     """
-    #     Generate samples from the model
+    def _generate_samples(self, iterations, batch_size):
+        """
+        Generate samples from the model
 
-    #     Args:
-    #         iterations (int): Number of iterations to generate samples for
-    #         batch_size (int): Batch size to use for sampling
+        Args:
+            iterations (int): Number of iterations to generate samples for
+            batch_size (int): Batch size to use for sampling
 
-    #     Returns:
-    #         samples (List[Dict[str, torch.Tensor]]), prompt_image_pairs (List[List[Any]])
-    #     """
-    #     samples = []
-    #     prompt_image_pairs = []
-    #     self.sd_pipeline.unet.eval()
+        Returns:
+            samples (List[Dict[str, torch.Tensor]]), prompt_image_pairs (List[List[Any]])
+        """
+        samples = []
+        prompt_image_pairs = []
+        self.sd_pipeline.unet.eval()
 
-    #     sample_neg_prompt_embeds = self.neg_prompt_embed.repeat(batch_size, 1, 1)
+        sample_neg_prompt_embeds = self.neg_prompt_embed.repeat(batch_size, 1, 1)
 
-    #     for _ in range(iterations):
-    #         prompts, prompt_metadata = zip(*[self.prompt_fn() for _ in range(batch_size)])
+        for i in range(iterations):
+            prompts, prompt_metadata = zip(*[self.prompt_fn() for _ in range(batch_size)])
 
-    #         prompt_ids = self.sd_pipeline.tokenizer(
-    #             prompts,
-    #             return_tensors="pt",
-    #             padding="max_length",
-    #             truncation=True,
-    #             max_length=self.sd_pipeline.tokenizer.model_max_length,
-    #         ).input_ids.to(self.accelerator.device)
-    #         prompt_embeds = self.sd_pipeline.text_encoder(prompt_ids)[0]
+            prompt_ids = self.sd_pipeline.tokenizer(
+                prompts,
+                return_tensors="pt",
+                padding="max_length",
+                truncation=True,
+                max_length=self.sd_pipeline.tokenizer.model_max_length,
+            ).input_ids.to(self.accelerator.device)
+            prompt_embeds = self.sd_pipeline.text_encoder(prompt_ids)[0]
 
-    #         with self.autocast():
-    #             sd_output = self.sd_pipeline(
-    #                 prompt_embeds=prompt_embeds,
-    #                 negative_prompt_embeds=sample_neg_prompt_embeds,
-    #                 num_inference_steps=self.config.sample_num_steps,
-    #                 guidance_scale=self.config.sample_guidance_scale,
-    #                 eta=self.config.sample_eta,
-    #                 output_type="pt",
-    #             )
+            with self.autocast():
+                sd_output = self.sd_pipeline(
+                    prompt_embeds=prompt_embeds,
+                    negative_prompt_embeds=sample_neg_prompt_embeds,
+                    num_inference_steps=self.config.sample_num_steps,
+                    guidance_scale=self.config.sample_guidance_scale,
+                    eta=self.config.sample_eta,
+                    output_type="pt",
+                )
 
-    #             images = sd_output.images
-    #             latents = sd_output.latents
-    #             log_probs = sd_output.log_probs
+                images = sd_output.images
+                latents = sd_output.latents
+                log_probs = sd_output.log_probs
 
-    #         latents = torch.stack(latents, dim=1)  # (batch_size, num_steps + 1, ...)
-    #         log_probs = torch.stack(log_probs, dim=1)  # (batch_size, num_steps, 1)
-    #         timesteps = self.sd_pipeline.scheduler.timesteps.repeat(batch_size, 1)  # (batch_size, num_steps)
+            latents = torch.stack(latents, dim=1)  # (batch_size, num_steps + 1, ...)
+            log_probs = torch.stack(log_probs, dim=1)  # (batch_size, num_steps, 1)
+            timesteps = self.sd_pipeline.scheduler.timesteps.clone().detach().repeat(batch_size, 1)
+            #print(f"{i}: bs:{batch_size} Timesteps{self.sd_pipeline.scheduler.timesteps}", flush=True)
+            timesteps = timesteps.to('hpu')
 
-    #         samples.append(
-    #             {
-    #                 "prompt_ids": prompt_ids,
-    #                 "prompt_embeds": prompt_embeds,
-    #                 "timesteps": timesteps,
-    #                 "latents": latents[:, :-1],  # each entry is the latent before timestep t
-    #                 "next_latents": latents[:, 1:],  # each entry is the latent after timestep t
-    #                 "log_probs": log_probs,
-    #                 "negative_prompt_embeds": sample_neg_prompt_embeds,
-    #             }
-    #         )
-    #         prompt_image_pairs.append([images, prompts, prompt_metadata])
+            samples.append(
+                {
+                    "prompt_ids": prompt_ids,
+                    "prompt_embeds": prompt_embeds,
+                    "timesteps": timesteps,
+                    "latents": latents[:, :-1],  # each entry is the latent before timestep t
+                    "next_latents": latents[:, 1:],  # each entry is the latent after timestep t
+                    "log_probs": log_probs,
+                    "negative_prompt_embeds": sample_neg_prompt_embeds,
+                }
+            )
+            prompt_image_pairs.append([images, prompts, prompt_metadata])
 
-    #     return samples, prompt_image_pairs
+        return samples, prompt_image_pairs
 
-    # def _train_batched_samples(self, inner_epoch, epoch, global_step, batched_samples):
-    #     """
-    #     Train on a batch of samples. Main training segment
+    def _train_batched_samples(self, inner_epoch, epoch, global_step, batched_samples):
+        """
+        Train on a batch of samples. Main training segment
 
-    #     Args:
-    #         inner_epoch (int): The current inner epoch
-    #         epoch (int): The current epoch
-    #         global_step (int): The current global step
-    #         batched_samples (List[Dict[str, torch.Tensor]]): The batched samples to train on
+        Args:
+            inner_epoch (int): The current inner epoch
+            epoch (int): The current epoch
+            global_step (int): The current global step
+            batched_samples (List[Dict[str, torch.Tensor]]): The batched samples to train on
 
-    #     Side Effects:
-    #         - Model weights are updated
-    #         - Logs the statistics to the accelerator trackers.
+        Side Effects:
+            - Model weights are updated
+            - Logs the statistics to the accelerator trackers.
 
-    #     Returns:
-    #         global_step (int): The updated global step
-    #     """
-    #     info = defaultdict(list)
-    #     for i, sample in enumerate(batched_samples):
-    #         if self.config.train_cfg:
-    #             # concat negative prompts to sample prompts to avoid two forward passes
-    #             embeds = torch.cat([sample["negative_prompt_embeds"], sample["prompt_embeds"]])
-    #         else:
-    #             embeds = sample["prompt_embeds"]
+        Returns:
+            global_step (int): The updated global step
+        """
+        info = defaultdict(list)
 
-    #         for j in range(self.num_train_timesteps):
-    #             with self.accelerator.accumulate(self.sd_pipeline.unet):
-    #                 loss, approx_kl, clipfrac = self.calculate_loss(
-    #                     sample["latents"][:, j],
-    #                     sample["timesteps"][:, j],
-    #                     sample["next_latents"][:, j],
-    #                     sample["log_probs"][:, j],
-    #                     sample["advantages"],
-    #                     embeds,
-    #                 )
-    #                 info["approx_kl"].append(approx_kl)
-    #                 info["clipfrac"].append(clipfrac)
-    #                 info["loss"].append(loss)
+        for i, sample in enumerate(batched_samples):
+            #print(f"Train batch Epoch {epoch} inner epoch{inner_epoch} [{i}]: {sample['timesteps']}", flush=True)
+            if self.config.train_cfg:
+                # concat negative prompts to sample prompts to avoid two forward passes
+                embeds = torch.cat([sample["negative_prompt_embeds"], sample["prompt_embeds"]])
+            else:
+                embeds = sample["prompt_embeds"]
 
-    #                 self.accelerator.backward(loss)
-    #                 if self.accelerator.sync_gradients:
-    #                     self.accelerator.clip_grad_norm_(
-    #                         self.trainable_layers.parameters()
-    #                         if not isinstance(self.trainable_layers, list)
-    #                         else self.trainable_layers,
-    #                         self.config.train_max_grad_norm,
-    #                     )
-    #                 self.optimizer.step()
-    #                 self.optimizer.zero_grad()
+            for j in range(self.num_train_timesteps):
+                #print(f"Epoch {epoch} inner epoch{inner_epoch} [{i},{j}]: {sample['timesteps'][:, j].max()}", flush=True)
+                with self.accelerator.accumulate(self.sd_pipeline.unet):
+                    loss, approx_kl, clipfrac = self.calculate_loss(
+                        sample["latents"][:, j],
+                        sample["timesteps"][:, j].long(),  # workaround for overflow issue
+                        sample["next_latents"][:, j],
+                        sample["log_probs"][:, j],
+                        sample["advantages"],
+                        embeds,
+                    )
+                    info["approx_kl"].append(approx_kl)
+                    info["clipfrac"].append(clipfrac)
+                    info["loss"].append(loss)
 
-    #             # Checks if the accelerator has performed an optimization step behind the scenes
-    #             if self.accelerator.sync_gradients:
-    #                 # log training-related stuff
-    #                 info = {k: torch.mean(torch.stack(v)) for k, v in info.items()}
-    #                 info = self.accelerator.reduce(info, reduction="mean")
-    #                 info.update({"epoch": epoch, "inner_epoch": inner_epoch})
-    #                 self.accelerator.log(info, step=global_step)
-    #                 global_step += 1
-    #                 info = defaultdict(list)
-    #     return global_step
+                    self.accelerator.backward(loss)
+                    if self.accelerator.sync_gradients:
+                        self.accelerator.clip_grad_norm_(
+                            self.trainable_layers.parameters()
+                            if not isinstance(self.trainable_layers, list)
+                            else self.trainable_layers,
+                            self.config.train_max_grad_norm,
+                        )
+                    self.optimizer.step()
+                    self.optimizer.zero_grad()
+
+                # Checks if the accelerator has performed an optimization step behind the scenes
+                if self.accelerator.sync_gradients:
+                    # log training-related stuff
+                    info = {k: torch.mean(torch.stack(v)) for k, v in info.items()}
+                    info = self.accelerator.reduce(info, reduction="mean")
+                    info.update({"epoch": epoch, "inner_epoch": inner_epoch})
+                    self.accelerator.log(info, step=global_step)
+                    global_step += 1
+                    info = defaultdict(list)
+        return global_step
 
     # def _config_check(self) -> Tuple[bool, str]:
     #     samples_per_epoch = (
