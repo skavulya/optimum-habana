@@ -365,7 +365,7 @@ def pipeline_step(
             latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
             latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
 
-            capture = True if False and i < 2 else False
+            capture = True if self.use_hpu_graphs and i < 2 else False
             # predict the noise residual
             noise_pred = self.unet_hpu(
                         latent_model_input,
