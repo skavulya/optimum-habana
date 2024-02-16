@@ -35,7 +35,6 @@ INSTALL_REQUIRES = [
     "accelerate < 0.28.0",
     "diffusers >= 0.26.0, < 0.27.0",
     "accelerate >= 0.23.0",
-    "diffusers >= 0.18.0, < 0.24.0",
     "trl",
     "peft < 0.7.0",
 ]
