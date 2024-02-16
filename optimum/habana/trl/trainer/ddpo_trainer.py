@@ -295,6 +295,10 @@ class GaudiDDPOTrainer(DDPOTrainer):
             self.image_samples_callback(prompt_image_data, global_step, self.accelerator.trackers[0])
 
         rewards = torch.cat(rewards)
+
+        if rewards.dtype == torch.bfloat16:
+            rewards = rewards.float()  # bf16 not supported by numpy
+            
         rewards = self.accelerator.gather(rewards).cpu().numpy()
 
         self.accelerator.log(
