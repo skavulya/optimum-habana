@@ -380,7 +380,7 @@ def pipeline_step(
                         prompt_embeds,
                         timestep_cond,
                         cross_attention_kwargs,
-                        added_cond_kwargs,
+                        added_cond_kwargs
                     )
 
             # perform guidance
