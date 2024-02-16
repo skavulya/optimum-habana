@@ -20,6 +20,7 @@ from typing import Any, Callable, Dict, List, Optional, Union
 
 import numpy as np
 import torch
+from diffusers.image_processor import PipelineImageInput
 from diffusers import DDIMScheduler, StableDiffusionPipeline, UNet2DConditionModel
 from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion import rescale_noise_cfg
 from diffusers.utils import convert_state_dict_to_diffusers
@@ -211,6 +212,7 @@ def pipeline_step(
     latents: Optional[torch.FloatTensor] = None,
     prompt_embeds: Optional[torch.FloatTensor] = None,
     negative_prompt_embeds: Optional[torch.FloatTensor] = None,
+    ip_adapter_image: Optional[PipelineImageInput] = None,
     output_type: Optional[str] = "pil",
     return_dict: bool = True,
     callback: Optional[Callable[[int, int, torch.FloatTensor], None]] = None,
@@ -254,6 +256,7 @@ def pipeline_step(
             Pre-generated negative text embeddings. Can be used to easily tweak text inputs, *e.g.* prompt
             weighting. If not provided, negative_prompt_embeds will be generated from `negative_prompt` input
             argument.
+        ip_adapter_image: (`PipelineImageInput`, *optional*): Optional image input to work with IP Adapters.
         output_type (`str`, *optional*, defaults to `"pil"`):
             The output format of the generate image. Choose between
             [PIL](https://pillow.readthedocs.io/en/stable/): `PIL.Image.Image` or `np.array`.
@@ -322,6 +325,10 @@ def pipeline_step(
         negative_prompt_embeds=negative_prompt_embeds,
         lora_scale=text_encoder_lora_scale,
     )
+    if ip_adapter_image is not None:
+        image_embeds = self.prepare_ip_adapter_image_embeds(
+            ip_adapter_image, device, batch_size * num_images_per_prompt
+    )
 
     # 4. Prepare timesteps
     self.scheduler.set_timesteps(num_inference_steps, device="cpu")
@@ -346,6 +353,7 @@ def pipeline_step(
     all_latents = [latents]
     all_log_probs = []
     # Optionally get Guidance Scale Embedding
+    added_cond_kwargs = {"image_embeds": image_embeds} if ip_adapter_image is not None else None
     timestep_cond = None
     if self.unet.config.time_cond_proj_dim is not None:
         guidance_scale_tensor = torch.tensor(self.guidance_scale - 1).repeat(
@@ -365,7 +373,6 @@ def pipeline_step(
             latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
             latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
 
-            capture = True if False and i < 2 else False
             # predict the noise residual
             noise_pred = self.unet_hpu(
                         latent_model_input,
@@ -373,7 +380,7 @@ def pipeline_step(
                         prompt_embeds,
                         timestep_cond,
                         cross_attention_kwargs,
-                        capture,
+                        added_cond_kwargs,
                     )
 
             # perform guidance
