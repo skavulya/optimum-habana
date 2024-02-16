@@ -499,7 +499,8 @@ class GaudiDefaultDDPOStableDiffusionPipeline(DefaultDDPOStableDiffusionPipeline
         self.sd_pipeline.unet.requires_grad_(not self.use_lora)
 
     def __call__(self, *args, **kwargs) -> DDPOPipelineOutput:
-        return pipeline_step(self.sd_pipeline, *args, **kwargs)
+        with torch.autocast(device_type="hpu", dtype=torch.bfloat16, enabled=self.gaudi_config.use_torch_autocast):
+            return pipeline_step(self.sd_pipeline, *args, **kwargs)
 
     def scheduler_step(self, *args, **kwargs) -> DDPOSchedulerOutput:
         return scheduler_step(self.sd_pipeline.scheduler, *args, **kwargs)
@@ -507,6 +508,10 @@ class GaudiDefaultDDPOStableDiffusionPipeline(DefaultDDPOStableDiffusionPipeline
     @property
     def unet(self):
         return self.sd_pipeline.unet
+    
+    @property
+    def unet_hpu(self):
+        return self.sd_pipeline.unet_hpu
 
     @property
     def vae(self):
