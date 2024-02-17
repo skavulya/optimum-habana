@@ -208,7 +208,7 @@ class GaudiDDPOTrainer(DDPOTrainer):
 
         # NOTE: for some reason, autocast is necessary for non-lora training but for lora training it isn't necessary and it uses
         # more memory
-        self.autocast = self.sd_pipeline.autocast or self.accelerator.autocast
+        self.autocast = self.accelerator.autocast
 
         if hasattr(self.sd_pipeline, "use_lora") and self.sd_pipeline.use_lora:
             unet, self.optimizer = self.accelerator.prepare(trainable_layers, self.optimizer)
@@ -393,23 +393,29 @@ class GaudiDDPOTrainer(DDPOTrainer):
             loss (torch.Tensor), approx_kl (torch.Tensor), clipfrac (torch.Tensor)
             (all of these are of shape (1,))
         """
-        with self.autocast():
+        with torch.autocast(device_type="hpu", dtype=torch.bfloat16):
             if self.config.train_cfg:
-                noise_pred = self.sd_pipeline.unet(
+                noise_pred = self.sd_pipeline.unet_hpu(
                     torch.cat([latents] * 2),
                     torch.cat([timesteps] * 2),
                     embeds,
-                ).sample
+                    None,
+                    None,
+                    None
+                )
                 noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
                 noise_pred = noise_pred_uncond + self.config.sample_guidance_scale * (
                     noise_pred_text - noise_pred_uncond
                 )
             else:
-                noise_pred = self.sd_pipeline.unet(
+                noise_pred = self.sd_pipeline.unet_hpu(
                     latents,
                     timesteps,
                     embeds,
-                ).sample
+                    None,
+                    None,
+                    None
+                )
             # compute the log prob of next_latents given latents under the current model
 
             scheduler_step_output = self.sd_pipeline.scheduler_step(
@@ -582,7 +588,7 @@ class GaudiDDPOTrainer(DDPOTrainer):
                     info["clipfrac"].append(clipfrac)
                     info["loss"].append(loss)
 
-                    self.accelerator.backward(loss)
+                    # self.accelerator.backward(loss)
                     if self.accelerator.sync_gradients:
                         self.accelerator.clip_grad_norm_(
                             self.trainable_layers.parameters()

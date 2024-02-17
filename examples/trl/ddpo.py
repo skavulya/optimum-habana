@@ -242,8 +242,7 @@ if __name__ == "__main__":
         use_hpu_graphs=args.use_hpu_graphs,
     )
 
-    with torch.autocast(device_type="hpu", dtype=torch.bfloat16):
-        trainer.train()
+    trainer.train()
 
     if args.push_to_hub:
         trainer.push_to_hub(args.hf_hub_model_id, token=args.hf_user_access_token)
