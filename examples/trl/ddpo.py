@@ -42,10 +42,11 @@ import torch.nn as nn
 from huggingface_hub import hf_hub_download
 from huggingface_hub.utils import EntryNotFoundError
 from transformers import CLIPModel, CLIPProcessor, HfArgumentParser
+from trl import DDPOConfig
 
 from optimum.habana import GaudiConfig
 from optimum.habana.trl import GaudiDDPOTrainer, GaudiDefaultDDPOStableDiffusionPipeline
-from trl import DDPOConfig
+
 
 @dataclass
 class ScriptArguments:

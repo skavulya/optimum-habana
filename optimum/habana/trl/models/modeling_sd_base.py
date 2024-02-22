@@ -12,33 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import contextlib
-import os
 import warnings
 from typing import Any, Callable, Dict, List, Optional, Union
 
 import numpy as np
 import torch
 from diffusers.image_processor import PipelineImageInput
-from diffusers import UNet2DConditionModel
 from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion import rescale_noise_cfg
-from diffusers.utils import convert_state_dict_to_diffusers
-
-from trl.import_utils import is_peft_available
-from trl.models import (
-    DDPOPipelineOutput,
-    DDPOSchedulerOutput,
-    DefaultDDPOStableDiffusionPipeline
-)
-
+from trl.models import DDPOPipelineOutput, DDPOSchedulerOutput, DefaultDDPOStableDiffusionPipeline
 from trl.models.modeling_sd_base import (
-    _left_broadcast,
     _get_variance,
+    _left_broadcast,
 )
-
-if is_peft_available():
-    from peft import LoraConfig
-    from peft.utils import get_peft_model_state_dict
 
 from optimum.habana import GaudiConfig
 from optimum.habana.diffusers import (

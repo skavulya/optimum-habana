@@ -15,9 +15,9 @@ import gc
 import unittest
 
 import torch
+from trl import DDPOConfig
 
 from optimum.habana import GaudiConfig
-from trl import DDPOConfig
 from optimum.habana.trl import GaudiDDPOTrainer, GaudiDefaultDDPOStableDiffusionPipeline
 
 

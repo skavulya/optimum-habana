@@ -19,17 +19,17 @@ from typing import Any, Callable, Optional, Tuple
 from warnings import warn
 
 import torch
-from tqdm.auto import tqdm
 from accelerate.logging import get_logger
-from accelerate.utils import ProjectConfiguration, DistributedDataParallelKwargs, set_seed
-
-
+from accelerate.utils import DistributedDataParallelKwargs, ProjectConfiguration, set_seed
+from tqdm.auto import tqdm
+from trl import DDPOTrainer
 from trl.models import DDPOStableDiffusionPipeline
 from trl.trainer import DDPOConfig
 from trl.trainer.utils import PerPromptStatTracker
-from trl import DDPOTrainer
+
 from optimum.habana import GaudiConfig
 from optimum.habana.accelerate import GaudiAccelerator
+
 
 logger = get_logger(__name__)
 
@@ -277,7 +277,7 @@ class GaudiDDPOTrainer(DDPOTrainer):
 
         if rewards.dtype == torch.bfloat16:
             rewards = rewards.float()  # bf16 not supported by numpy
-            
+
         rewards = self.accelerator.gather(rewards).cpu().numpy()
 
         self.accelerator.log(
