@@ -15,13 +15,12 @@
 import contextlib
 import os
 import warnings
-from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Union
 
 import numpy as np
 import torch
 from diffusers.image_processor import PipelineImageInput
-from diffusers import DDIMScheduler, StableDiffusionPipeline, UNet2DConditionModel
+from diffusers import UNet2DConditionModel
 from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion import rescale_noise_cfg
 from diffusers.utils import convert_state_dict_to_diffusers
 
@@ -32,7 +31,11 @@ from trl.models import (
     DefaultDDPOStableDiffusionPipeline
 )
 
-from trl.models.modeling_sd_base import _left_broadcast
+from trl.models.modeling_sd_base import (
+    _left_broadcast,
+    _get_variance,
+)
+
 if is_peft_available():
     from peft import LoraConfig
     from peft.utils import get_peft_model_state_dict
@@ -42,21 +45,6 @@ from optimum.habana.diffusers import (
     GaudiDDIMScheduler,
     GaudiStableDiffusionPipeline,
 )
-
-
-def _get_variance(self, timestep, prev_timestep):
-    alpha_prod_t = torch.gather(self.alphas_cumprod, 0, timestep.cpu()).to(timestep.device)
-    alpha_prod_t_prev = torch.where(
-        prev_timestep.cpu() >= 0,
-        self.alphas_cumprod.gather(0, prev_timestep.cpu()),
-        self.final_alpha_cumprod,
-    ).to(timestep.device)
-    beta_prod_t = 1 - alpha_prod_t
-    beta_prod_t_prev = 1 - alpha_prod_t_prev
-
-    variance = (beta_prod_t_prev / beta_prod_t) * (1 - alpha_prod_t / alpha_prod_t_prev)
-
-    return variance
 
 
 def scheduler_step(
@@ -70,9 +58,11 @@ def scheduler_step(
     prev_sample: Optional[torch.FloatTensor] = None,
 ) -> DDPOSchedulerOutput:
     """
-
     Predict the sample at the previous timestep by reversing the SDE. Core function to propagate the diffusion
     process from the learned model outputs (most often the predicted noise).
+
+    Adapted from: https://github.com/huggingface/trl/blob/v0.7.6/trl/models/modeling_sd_base.py#L182
+        - Changed random number generation for HPU
 
     Args:
         model_output (`torch.FloatTensor`): direct output from learned diffusion model.
@@ -222,6 +212,11 @@ def pipeline_step(
     guidance_rescale: float = 0.0,
 ):
     r"""
+    Adapted from: https://github.com/huggingface/trl/blob/5fc66d6dbffd18d21dc505ecf1199533dd85fe38/trl/models/modeling_sd_base.py#L320
+        - Two `mark_step()` were added to add support for lazy mode
+        - Added support for HPU graphs
+        - Reset time-dependent variables in Gaudi scheduler
+
     Function invoked when calling the pipeline for generation.  Args: prompt (`str` or `List[str]`, *optional*): The prompt or prompts to guide the image generation. If not defined, one has to pass `prompt_embeds`.  instead.  height (`int`, *optional*, defaults to self.unet.config.sample_size * self.vae_scale_factor): The height in pixels of the generated image.
         width (`int`, *optional*, defaults to self.unet.config.sample_size * self.vae_scale_factor):
             The width in pixels of the generated image.
@@ -374,7 +369,6 @@ def pipeline_step(
             latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
 
             # predict the noise residual
-
             noise_pred = self.unet_hpu(
                         latent_model_input,
                         t,
@@ -426,7 +420,6 @@ def pipeline_step(
         do_denormalize = [not has_nsfw for has_nsfw in has_nsfw_concept]
 
     image = self.image_processor.postprocess(image, output_type=output_type, do_denormalize=do_denormalize)
-    #breakpoint()
     # Offload last model to CPU
     if hasattr(self, "final_offload_hook") and self.final_offload_hook is not None:
         self.final_offload_hook.offload()
@@ -444,6 +437,11 @@ class GaudiDefaultDDPOStableDiffusionPipeline(DefaultDDPOStableDiffusionPipeline
                  bf16_full_eval: bool = False,
                  ):
         """
+        Adapted from: https://github.com/huggingface/trl/blob/v0.7.6/trl/models/modeling_sd_base.py#L526
+        - use GaudiStableDiffusionPipeline instead of StableDiffusionPipeline
+        - use GaudiDDIMScheduler instead of DDIMScheduler
+        - support bf16.
+
         pretrained_model_name (str):
             Name of pretrained model.
         pretrained_model_revision (str):
@@ -467,7 +465,7 @@ class GaudiDefaultDDPOStableDiffusionPipeline(DefaultDDPOStableDiffusionPipeline
             use_habana=use_habana,
             use_hpu_graphs=use_hpu_graphs,
             gaudi_config=gaudi_config,
-            torch_dtype=torch.bfloat16
+            torch_dtype=torch.bfloat16 if bf16_full_eval else torch.float32
         )
 
         self.use_lora = use_lora
@@ -476,7 +474,7 @@ class GaudiDefaultDDPOStableDiffusionPipeline(DefaultDDPOStableDiffusionPipeline
         self.use_habana = use_habana
         self.use_hpu_graphs = use_hpu_graphs
         self.gaudi_config = gaudi_config
-        self.bf16_full_eval = bf16_full_eval
+
         try:
             self.sd_pipeline.load_lora_weights(
                 pretrained_model_name,
@@ -500,92 +498,10 @@ class GaudiDefaultDDPOStableDiffusionPipeline(DefaultDDPOStableDiffusionPipeline
         self.sd_pipeline.unet.requires_grad_(not self.use_lora)
 
     def __call__(self, *args, **kwargs) -> DDPOPipelineOutput:
-        with torch.autocast(device_type="hpu", dtype=torch.bfloat16, enabled=self.gaudi_config.use_torch_autocast):
+        device = "hpu" if self.use_habana else "cpu"
+        with torch.autocast(device_type=device, dtype=torch.bfloat16, enabled=self.gaudi_config.use_torch_autocast):
             return pipeline_step(self.sd_pipeline, *args, **kwargs)
 
-    def scheduler_step(self, *args, **kwargs) -> DDPOSchedulerOutput:
-        return scheduler_step(self.sd_pipeline.scheduler, *args, **kwargs)
-
-    @property
-    def unet(self):
-        return self.sd_pipeline.unet
-    
     @property
     def unet_hpu(self):
         return self.sd_pipeline.unet_hpu
-
-    @property
-    def vae(self):
-        return self.sd_pipeline.vae
-
-    @property
-    def tokenizer(self):
-        return self.sd_pipeline.tokenizer
-
-    @property
-    def scheduler(self):
-        return self.sd_pipeline.scheduler
-
-    @property
-    def text_encoder(self):
-        return self.sd_pipeline.text_encoder
-
-    @property
-    def autocast(self):
-        return contextlib.nullcontext if self.use_lora else None
-
-    def save_pretrained(self, output_dir):
-        if self.use_lora:
-            state_dict = convert_state_dict_to_diffusers(get_peft_model_state_dict(self.sd_pipeline.unet))
-            self.sd_pipeline.save_lora_weights(save_directory=output_dir, unet_lora_layers=state_dict)
-        self.sd_pipeline.save_pretrained(output_dir)
-
-    def set_progress_bar_config(self, *args, **kwargs):
-        self.sd_pipeline.set_progress_bar_config(*args, **kwargs)
-
-    def get_trainable_layers(self):
-        if self.use_lora:
-            lora_config = LoraConfig(
-                r=4,
-                lora_alpha=4,
-                init_lora_weights="gaussian",
-                target_modules=["to_k", "to_q", "to_v", "to_out.0"],
-            )
-            self.sd_pipeline.unet.add_adapter(lora_config)
-
-            # To avoid accelerate unscaling problems in FP16.
-            for param in self.sd_pipeline.unet.parameters():
-                # only upcast trainable parameters (LoRA) into fp32
-                if param.requires_grad:
-                    param.data = param.to(torch.float32)
-            return self.sd_pipeline.unet
-        else:
-            return self.sd_pipeline.unet
-
-    def save_checkpoint(self, models, weights, output_dir):
-        if len(models) != 1:
-            raise ValueError("Given how the trainable params were set, this should be of length 1")
-        if self.use_lora and hasattr(models[0], "peft_config") and getattr(models[0], "peft_config", None) is not None:
-            state_dict = convert_state_dict_to_diffusers(get_peft_model_state_dict(models[0]))
-            self.sd_pipeline.save_lora_weights(save_directory=output_dir, unet_lora_layers=state_dict)
-        elif not self.use_lora and isinstance(models[0], UNet2DConditionModel):
-            models[0].save_pretrained(os.path.join(output_dir, "unet"))
-        else:
-            raise ValueError(f"Unknown model type {type(models[0])}")
-
-    def load_checkpoint(self, models, input_dir):
-        if len(models) != 1:
-            raise ValueError("Given how the trainable params were set, this should be of length 1")
-        if self.use_lora:
-            lora_state_dict, network_alphas = self.sd_pipeline.lora_state_dict(
-                input_dir, weight_name="pytorch_lora_weights.safetensors"
-            )
-            self.sd_pipeline.load_lora_into_unet(lora_state_dict, network_alphas=network_alphas, unet=models[0])
-
-        elif not self.use_lora and isinstance(models[0], UNet2DConditionModel):
-            load_model = UNet2DConditionModel.from_pretrained(input_dir, subfolder="unet")
-            models[0].register_to_config(**load_model.config)
-            models[0].load_state_dict(load_model.state_dict())
-            del load_model
-        else:
-            raise ValueError(f"Unknown model type {type(models[0])}")

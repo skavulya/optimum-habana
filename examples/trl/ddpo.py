@@ -11,6 +11,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# Adapted from: https://github.com/huggingface/trl/blob/v0.7.6/examples/scripts/ddpo.py
+# The only differences are:
+#   - add new args gaudi_config
+#   - use GaudiDefaultDDPOStableDiffusionPipeline instead of DefaultDDPOStableDiffusionPipeline
+#   - use GaudiDDPOTrainer instead of DDPOTrainer
+#   - use hpu in aesthetic_scorer
+#   - cast model to bf16.
+
 """
 python examples/scripts/ddpo.py \
     --num_epochs=200 \
@@ -36,7 +45,6 @@ from transformers import CLIPModel, CLIPProcessor, HfArgumentParser
 
 from optimum.habana import GaudiConfig
 from optimum.habana.trl import GaudiDDPOTrainer, GaudiDefaultDDPOStableDiffusionPipeline
-from optimum.habana.utils import set_seed
 from trl import DDPOConfig
 
 @dataclass
@@ -214,9 +222,6 @@ if __name__ == "__main__":
 
     # 1. initialize Gaudi config:
     gaudi_config = GaudiConfig.from_pretrained(args.gaudi_config_name) if args.use_habana else None
-
-    # Set seed before initializing model.
-    set_seed(42)  # TODO: Check if necessary
 
     pipeline = GaudiDefaultDDPOStableDiffusionPipeline(
         args.pretrained_model,
