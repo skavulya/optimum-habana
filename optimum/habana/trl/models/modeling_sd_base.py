@@ -25,7 +25,6 @@ from diffusers import DDIMScheduler, StableDiffusionPipeline, UNet2DConditionMod
 from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion import rescale_noise_cfg
 from diffusers.utils import convert_state_dict_to_diffusers
 
-from trl.core import randn_tensor
 from trl.import_utils import is_peft_available
 from trl.models import (
     DDPOPipelineOutput,
@@ -175,12 +174,14 @@ def scheduler_step(
         )
 
     if prev_sample is None:
-        variance_noise = randn_tensor(
+        # torch.randn is broken on HPU so running it on CPU
+        rand_device = "cpu" if model_output.type == "hpu" else model_output.device
+        variance_noise = torch.randn(
             model_output.shape,
             generator=generator,
-            device=model_output.device,
+            device=rand_device,
             dtype=model_output.dtype,
-        )
+        ).to(model_output.device)
         prev_sample = prev_sample_mean + std_dev_t * variance_noise
 
     # log prob of prev_sample given prev_sample_mean and std_dev_t
@@ -364,7 +365,6 @@ def pipeline_step(
         ).to(device=device, dtype=latents.dtype)
 
     with self.progress_bar(total=num_inference_steps) as progress_bar:
-        #for i, t in enumerate(timesteps):
         for i in range(num_inference_steps):
             t = timesteps[0]
             timesteps = torch.roll(timesteps, shifts=-1, dims=0)
@@ -374,6 +374,7 @@ def pipeline_step(
             latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
 
             # predict the noise residual
+
             noise_pred = self.unet_hpu(
                         latent_model_input,
                         t,
@@ -425,7 +426,7 @@ def pipeline_step(
         do_denormalize = [not has_nsfw for has_nsfw in has_nsfw_concept]
 
     image = self.image_processor.postprocess(image, output_type=output_type, do_denormalize=do_denormalize)
-
+    #breakpoint()
     # Offload last model to CPU
     if hasattr(self, "final_offload_hook") and self.final_offload_hook is not None:
         self.final_offload_hook.offload()
@@ -466,7 +467,7 @@ class GaudiDefaultDDPOStableDiffusionPipeline(DefaultDDPOStableDiffusionPipeline
             use_habana=use_habana,
             use_hpu_graphs=use_hpu_graphs,
             gaudi_config=gaudi_config,
-            bf16_full_eval=bf16_full_eval
+            torch_dtype=torch.bfloat16
         )
 
         self.use_lora = use_lora

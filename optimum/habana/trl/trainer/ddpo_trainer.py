@@ -20,16 +20,14 @@ from typing import Any, Callable, Optional, Tuple
 from warnings import warn
 
 import torch
-from accelerate import Accelerator
 from accelerate.logging import get_logger
-from accelerate.utils import ProjectConfiguration, DistributedDataParallelKwargs, set_seed
-from huggingface_hub import whoami
+from accelerate.utils import ProjectConfiguration, DistributedDataParallelKwargs, set_seed, tqdm
 
 from trl.models import DDPOStableDiffusionPipeline
-from trl.trainer import BaseTrainer, DDPOConfig
+from trl.trainer import DDPOConfig
 from trl.trainer.utils import PerPromptStatTracker
 from trl import DDPOTrainer
-from optimum.habana import GaudiConfig, GaudiTrainer, GaudiTrainingArguments
+from optimum.habana import GaudiConfig
 from optimum.habana.accelerate import GaudiAccelerator
 
 logger = get_logger(__name__)
@@ -127,12 +125,13 @@ class GaudiDDPOTrainer(DDPOTrainer):
             log_with=self.config.log_with,
             mixed_precision=self.config.mixed_precision,
             project_config=accelerator_project_config,
-            cpu = (not use_habana),
+            cpu=(not use_habana),
             kwargs_handlers=[kwargs],
             # we always accumulate gradients across timesteps; we want config.train.gradient_accumulation_steps to be the
             # number of *samples* we accumulate across, so we need to multiply by the number of training timesteps to get
             # the total number of optimizer steps to accumulate across.
             gradient_accumulation_steps=self.config.train_gradient_accumulation_steps * self.num_train_timesteps,
+            force_autocast=self.config.mixed_precision == "bf16",
             **self.config.accelerator_kwargs,
         )
 
@@ -181,11 +180,6 @@ class GaudiDDPOTrainer(DDPOTrainer):
         self.accelerator.register_save_state_pre_hook(self._save_model_hook)
         self.accelerator.register_load_state_pre_hook(self._load_model_hook)
 
-        # Enable TF32 for faster training on Ampere GPUs,
-        # cf https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices
-        if self.config.allow_tf32:
-            torch.backends.cuda.matmul.allow_tf32 = True
-
         self.optimizer = self._setup_optimizer(
             trainable_layers.parameters() if not isinstance(trainable_layers, list) else trainable_layers
         )
@@ -231,26 +225,6 @@ class GaudiDDPOTrainer(DDPOTrainer):
             self.first_epoch = int(config.resume_from.split("_")[-1]) + 1
         else:
             self.first_epoch = 0
-
-    # def compute_rewards(self, prompt_image_pairs, is_async=False):
-    #     if not is_async:
-    #         rewards = []
-    #         for images, prompts, prompt_metadata in prompt_image_pairs:
-    #             reward, reward_metadata = self.reward_fn(images, prompts, prompt_metadata)
-    #             rewards.append(
-    #                 (
-    #                     torch.as_tensor(reward, device=self.accelerator.device),
-    #                     reward_metadata,
-    #                 )
-    #             )
-    #     else:
-    #         rewards = self.executor.map(lambda x: self.reward_fn(*x), prompt_image_pairs)
-    #         rewards = [
-    #             (torch.as_tensor(reward.result(), device=self.accelerator.device), reward_metadata.result())
-    #             for reward, reward_metadata in rewards
-    #         ]
-
-    #     return zip(*rewards)
 
     def step(self, epoch: int, global_step: int):
         """
@@ -313,7 +287,7 @@ class GaudiDDPOTrainer(DDPOTrainer):
 
         if self.config.per_prompt_stat_tracking:
             # gather the prompts across processes
-            prompt_ids = self.accelerator.gather(samples["prompt_ids"]).cpu().long().numpy() # Workaround for overflow
+            prompt_ids = self.accelerator.gather(samples["prompt_ids"]).cpu().long().numpy()  # Workaround for long() overflow
             prompts = self.sd_pipeline.tokenizer.batch_decode(prompt_ids, skip_special_tokens=True)
             advantages = self.stat_tracker.update(prompts, rewards)
         else:
@@ -393,29 +367,23 @@ class GaudiDDPOTrainer(DDPOTrainer):
             loss (torch.Tensor), approx_kl (torch.Tensor), clipfrac (torch.Tensor)
             (all of these are of shape (1,))
         """
-        with torch.autocast(device_type="hpu", dtype=torch.bfloat16):
+        with self.autocast():
             if self.config.train_cfg:
-                noise_pred = self.sd_pipeline.unet_hpu(
+                noise_pred = self.sd_pipeline.unet(
                     torch.cat([latents] * 2),
                     torch.cat([timesteps] * 2),
                     embeds,
-                    None,
-                    None,
-                    None
-                )
+                ).sample
                 noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
                 noise_pred = noise_pred_uncond + self.config.sample_guidance_scale * (
                     noise_pred_text - noise_pred_uncond
                 )
             else:
-                noise_pred = self.sd_pipeline.unet_hpu(
+                noise_pred = self.sd_pipeline.unet(
                     latents,
                     timesteps,
                     embeds,
-                    None,
-                    None,
-                    None
-                )
+                ).sample
             # compute the log prob of next_latents given latents under the current model
 
             scheduler_step_output = self.sd_pipeline.scheduler_step(
@@ -443,44 +411,6 @@ class GaudiDDPOTrainer(DDPOTrainer):
         clipfrac = torch.mean((torch.abs(ratio - 1.0) > self.config.train_clip_range).float())
 
         return loss, approx_kl, clipfrac
-
-    # def loss(
-    #     self,
-    #     advantages: torch.Tensor,
-    #     clip_range: float,
-    #     ratio: torch.Tensor,
-    # ):
-    #     unclipped_loss = -advantages * ratio
-    #     clipped_loss = -advantages * torch.clamp(
-    #         ratio,
-    #         1.0 - clip_range,
-    #         1.0 + clip_range,
-    #     )
-    #     return torch.mean(torch.maximum(unclipped_loss, clipped_loss))
-
-    # def _setup_optimizer(self, trainable_layers_parameters):
-    #     if self.config.train_use_8bit_adam:
-    #         import bitsandbytes
-
-    #         optimizer_cls = bitsandbytes.optim.AdamW8bit
-    #     else:
-    #         optimizer_cls = torch.optim.AdamW
-
-    #     return optimizer_cls(
-    #         trainable_layers_parameters,
-    #         lr=self.config.train_learning_rate,
-    #         betas=(self.config.train_adam_beta1, self.config.train_adam_beta2),
-    #         weight_decay=self.config.train_adam_weight_decay,
-    #         eps=self.config.train_adam_epsilon,
-    #     )
-
-    # def _save_model_hook(self, models, weights, output_dir):
-    #     self.sd_pipeline.save_checkpoint(models, weights, output_dir)
-    #     weights.pop()  # ensures that accelerate doesn't try to handle saving of the model
-
-    # def _load_model_hook(self, models, input_dir):
-    #     self.sd_pipeline.load_checkpoint(models, input_dir)
-    #     models.pop()  # ensures that accelerate doesn't try to handle loading of the model
 
     def _generate_samples(self, iterations, batch_size):
         """
@@ -527,7 +457,7 @@ class GaudiDDPOTrainer(DDPOTrainer):
 
             latents = torch.stack(latents, dim=1)  # (batch_size, num_steps + 1, ...)
             log_probs = torch.stack(log_probs, dim=1)  # (batch_size, num_steps, 1)
-            timesteps = self.sd_pipeline.scheduler.timesteps.clone().detach().repeat(batch_size, 1)
+            timesteps = self.sd_pipeline.scheduler.timesteps.repeat(batch_size, 1)
             #print(f"{i}: bs:{batch_size} Timesteps{self.sd_pipeline.scheduler.timesteps}", flush=True)
             timesteps = timesteps.to('hpu')
 
@@ -566,21 +496,35 @@ class GaudiDDPOTrainer(DDPOTrainer):
         info = defaultdict(list)
 
         for i, sample in enumerate(batched_samples):
-            #print(f"Train batch Epoch {epoch} inner epoch{inner_epoch} [{i}]: {sample['timesteps']}", flush=True)
+            print(f"Train batch Epoch {epoch} inner epoch{inner_epoch} [{i}]: {sample['timesteps']}", flush=True)
             if self.config.train_cfg:
                 # concat negative prompts to sample prompts to avoid two forward passes
                 embeds = torch.cat([sample["negative_prompt_embeds"], sample["prompt_embeds"]])
             else:
                 embeds = sample["prompt_embeds"]
 
-            for j in range(self.num_train_timesteps):
-                #print(f"Epoch {epoch} inner epoch{inner_epoch} [{i},{j}]: {sample['timesteps'][:, j].max()}", flush=True)
+            latents = sample["latents"]
+            timesteps = sample["timesteps"]
+            next_latents = sample["next_latents"]
+            log_probs = sample["log_probs"]
+
+            for j in range(self.num_train_timesteps): #, desc=f"Epoch{i}"):
+                print(f"Epoch {epoch} inner epoch{inner_epoch} [{i},{j}]: ts: {sample['timesteps'][:, j].max()}", flush=True)
                 with self.accelerator.accumulate(self.sd_pipeline.unet):
+                    # Reduce recompilations by avoiding constant variables in loops
+                    latent = latents[:, 0]
+                    timestep = timesteps[:, 0].long()
+                    next_latent = next_latents[:, 0]
+                    log_prob = log_probs[:, 0]
+                    latents = torch.roll(latents, shifts=-1, dims=1)
+                    timesteps = torch.roll(timesteps, shifts=-1, dims=1)
+                    next_latents = torch.roll(next_latents, shifts=-1, dims=1)
+                    log_probs = torch.roll(log_probs, shifts=-1, dims=1)
                     loss, approx_kl, clipfrac = self.calculate_loss(
-                        sample["latents"][:, j],
-                        sample["timesteps"][:, j].long(),  # workaround for overflow issue
-                        sample["next_latents"][:, j],
-                        sample["log_probs"][:, j],
+                        latent,
+                        timestep,
+                        next_latent,
+                        log_prob,
                         sample["advantages"],
                         embeds,
                     )
@@ -588,7 +532,7 @@ class GaudiDDPOTrainer(DDPOTrainer):
                     info["clipfrac"].append(clipfrac)
                     info["loss"].append(loss)
 
-                    # self.accelerator.backward(loss)
+                    self.accelerator.backward(loss)
                     if self.accelerator.sync_gradients:
                         self.accelerator.clip_grad_norm_(
                             self.trainable_layers.parameters()
@@ -609,65 +553,3 @@ class GaudiDDPOTrainer(DDPOTrainer):
                     global_step += 1
                     info = defaultdict(list)
         return global_step
-
-    # def _config_check(self) -> Tuple[bool, str]:
-    #     samples_per_epoch = (
-    #         self.config.sample_batch_size * self.accelerator.num_processes * self.config.sample_num_batches_per_epoch
-    #     )
-    #     total_train_batch_size = (
-    #         self.config.train_batch_size
-    #         * self.accelerator.num_processes
-    #         * self.config.train_gradient_accumulation_steps
-    #     )
-
-    #     if not self.config.sample_batch_size >= self.config.train_batch_size:
-    #         return (
-    #             False,
-    #             f"Sample batch size ({self.config.sample_batch_size}) must be greater than or equal to the train batch size ({self.config.train_batch_size})",
-    #         )
-    #     if not self.config.sample_batch_size % self.config.train_batch_size == 0:
-    #         return (
-    #             False,
-    #             f"Sample batch size ({self.config.sample_batch_size}) must be divisible by the train batch size ({self.config.train_batch_size})",
-    #         )
-    #     if not samples_per_epoch % total_train_batch_size == 0:
-    #         return (
-    #             False,
-    #             f"Number of samples per epoch ({samples_per_epoch}) must be divisible by the total train batch size ({total_train_batch_size})",
-    #         )
-    #     return True, ""
-
-    # def train(self, epochs: Optional[int] = None):
-    #     """
-    #     Train the model for a given number of epochs
-    #     """
-    #     global_step = 0
-    #     if epochs is None:
-    #         epochs = self.config.num_epochs
-    #     for epoch in range(self.first_epoch, epochs):
-    #         global_step = self.step(epoch, global_step)
-
-    # def create_model_card(self, path: str, model_name: Optional[str] = "TRL DDPO Model") -> None:
-    #     """Creates and saves a model card for a TRL model.
-
-    #     Args:
-    #         path (`str`): The path to save the model card to.
-    #         model_name (`str`, *optional*): The name of the model, defaults to `TRL DDPO Model`.
-    #     """
-    #     try:
-    #         user = whoami()["name"]
-    #     # handle the offline case
-    #     except:  # noqa
-    #         warnings.warn("Cannot retrieve user information assuming you are running in offline mode.")
-    #         return
-
-    #     if not os.path.exists(path):
-    #         os.makedirs(path)
-
-    #     model_card_content = MODEL_CARD_TEMPLATE.format(model_name=model_name, model_id=f"{user}/{path}")
-    #     with open(os.path.join(path, "README.md"), "w", encoding="utf-8") as f:
-    #         f.write(model_card_content)
-
-    # def _save_pretrained(self, save_directory):
-    #     self.sd_pipeline.save_pretrained(save_directory)
-    #     self.create_model_card(save_directory)
