@@ -483,10 +483,13 @@ class GaudiDefaultDDPOStableDiffusionPipeline(DefaultDDPOStableDiffusionPipeline
         self.sd_pipeline.unet.requires_grad_(not self.use_lora)
 
     def __call__(self, *args, **kwargs) -> DDPOPipelineOutput:
-        device = "hpu" if self.use_habana else "cpu"
-        with torch.autocast(device_type=device, dtype=torch.bfloat16, enabled=self.gaudi_config.use_torch_autocast):
+        autocast = self.gaudi_config.use_torch_autocast if self.gaudi_config else True
+        with torch.autocast(device_type=self.sd_pipeline._device.type, dtype=torch.bfloat16, enabled=autocast):
             return pipeline_step(self.sd_pipeline, *args, **kwargs)
 
     @property
     def unet_hpu(self):
-        return self.sd_pipeline.unet_hpu
+        if self.use_habana:
+            return self.sd_pipeline.unet_hpu
+        else:
+            return self.sd_pipeline.unet

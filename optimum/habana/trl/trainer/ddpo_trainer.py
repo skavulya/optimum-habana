@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
+import contextlib
 import os
 from collections import defaultdict
 from concurrent import futures
@@ -20,7 +20,7 @@ from warnings import warn
 
 import torch
 from accelerate.logging import get_logger
-from accelerate.utils import DistributedDataParallelKwargs, ProjectConfiguration, set_seed
+from accelerate.utils import DistributedDataParallelKwargs, ProjectConfiguration
 from tqdm.auto import tqdm
 from trl import DDPOTrainer
 from trl.models import DDPOStableDiffusionPipeline
@@ -29,6 +29,7 @@ from trl.trainer.utils import PerPromptStatTracker
 
 from optimum.habana import GaudiConfig
 from optimum.habana.accelerate import GaudiAccelerator
+from optimum.habana.utils import set_seed
 
 
 logger = get_logger(__name__)
@@ -95,6 +96,7 @@ class GaudiDDPOTrainer(DDPOTrainer):
         self.reward_fn = reward_function
         self.config = config
         self.image_samples_callback = image_samples_hook
+        self.gaudi_config = gaudi_config
         self.use_hpu_graphs = use_hpu_graphs
         self.use_habana = use_habana
 
@@ -141,7 +143,6 @@ class GaudiDDPOTrainer(DDPOTrainer):
             # number of *samples* we accumulate across, so we need to multiply by the number of training timesteps to get
             # the total number of optimizer steps to accumulate across.
             gradient_accumulation_steps=self.config.train_gradient_accumulation_steps * self.num_train_timesteps,
-            force_autocast=self.config.mixed_precision == "bf16",
             **self.config.accelerator_kwargs,
         )
 
@@ -160,7 +161,7 @@ class GaudiDDPOTrainer(DDPOTrainer):
 
         logger.info(f"\n{config}")
 
-        set_seed(self.config.seed, device_specific=True)
+        set_seed(self.config.seed)
 
         self.sd_pipeline = sd_pipeline
 
@@ -174,9 +175,7 @@ class GaudiDDPOTrainer(DDPOTrainer):
 
         # For mixed precision training we cast all non-trainable weights (vae, non-lora text_encoder and non-lora unet) to half-precision
         # as these weights are only used for inference, keeping weights in full precision is not required.
-        if self.accelerator.mixed_precision == "fp16":
-            inference_dtype = torch.float16
-        elif self.accelerator.mixed_precision == "bf16":
+        if self.accelerator.mixed_precision == "bf16":
             inference_dtype = torch.bfloat16
         else:
             inference_dtype = torch.float32
@@ -210,15 +209,31 @@ class GaudiDDPOTrainer(DDPOTrainer):
                 config.per_prompt_stat_tracking_min_count,
             )
 
-        # NOTE: for some reason, autocast is necessary for non-lora training but for lora training it isn't necessary and it uses
-        # more memory
-        self.autocast = self.accelerator.autocast
+        # Workaround for ddpo loss instability in v1.14.0 when autocast is enabled for lora training
+        self.use_lora = hasattr(self.sd_pipeline, "use_lora") and self.sd_pipeline.use_lora
+        self.use_autocast = self.gaudi_config.use_torch_autocast if self.gaudi_config else True
+        self.autocast = contextlib.nullcontext if self.use_lora else self.accelerator.autocast
 
-        if hasattr(self.sd_pipeline, "use_lora") and self.sd_pipeline.use_lora:
+        if self.use_lora:
             unet, self.optimizer = self.accelerator.prepare(trainable_layers, self.optimizer)
             self.trainable_layers = list(filter(lambda p: p.requires_grad, unet.parameters()))
         else:
             self.trainable_layers, self.optimizer = self.accelerator.prepare(trainable_layers, self.optimizer)
+
+        if self.gaudi_config.use_fused_clip_norm:
+            try:
+                from habana_frameworks.torch.hpex.normalization import FusedClipNorm
+            except ImportError as error:
+                error.msg = (
+                    f"Could not import 'FusedClipNorm' from 'habana_frameworks.torch.hpex.normalization'. {error.msg}."
+                )
+                raise error
+            self.FusedNorm = FusedClipNorm(
+                self.trainable_layers.parameters()
+                if not isinstance(self.trainable_layers, list)
+                else self.trainable_layers,
+                self.config.train_max_grad_norm,
+            )
 
         if use_hpu_graphs:
             import habana_frameworks.torch as ht
@@ -316,13 +331,15 @@ class GaudiDDPOTrainer(DDPOTrainer):
         )
         for inner_epoch in pbar:
             # shuffle samples along batch dimension
-            perm = torch.randperm(total_batch_size, device=self.accelerator.device)
+            #perm = torch.randperm(total_batch_size, device=self.accelerator.device)
+            rand_device = 'cpu' if self.accelerator.device.type == 'hpu' else self.accelerator.device
+            perm = torch.randperm(total_batch_size, device=rand_device).to(self.accelerator.device)
             samples = {k: v[perm] for k, v in samples.items()}
 
             # shuffle along time dimension independently for each sample
             # still trying to understand the code below
             perms = torch.stack(
-                [torch.randperm(num_timesteps, device=self.accelerator.device) for _ in range(total_batch_size)]
+                [torch.randperm(num_timesteps, device=rand_device).to(self.accelerator.device) for _ in range(total_batch_size)]
             )
 
             for key in ["timesteps", "latents", "next_latents", "log_probs"]:
@@ -353,6 +370,75 @@ class GaudiDDPOTrainer(DDPOTrainer):
             self.accelerator.save_state()
 
         return global_step
+
+    def calculate_loss(self, latents, timesteps, next_latents, log_probs, advantages, embeds):
+        """
+        Calculate the loss for a batch of an unpacked sample
+
+        Args:
+            latents (torch.Tensor):
+                The latents sampled from the diffusion model, shape: [batch_size, num_channels_latents, height, width]
+            timesteps (torch.Tensor):
+                The timesteps sampled from the diffusion model, shape: [batch_size]
+            next_latents (torch.Tensor):
+                The next latents sampled from the diffusion model, shape: [batch_size, num_channels_latents, height, width]
+            log_probs (torch.Tensor):
+                The log probabilities of the latents, shape: [batch_size]
+            advantages (torch.Tensor):
+                The advantages of the latents, shape: [batch_size]
+            embeds (torch.Tensor):
+                The embeddings of the prompts, shape: [2*batch_size or batch_size, ...]
+                Note: the "or" is because if train_cfg is True, the expectation is that negative prompts are concatenated to the embeds
+
+        Returns:
+            loss (torch.Tensor), approx_kl (torch.Tensor), clipfrac (torch.Tensor)
+            (all of these are of shape (1,))
+        """
+        with torch.autocast(device_type=self.accelerator.device.type, dtype=torch.bfloat16, enabled=self.use_autocast):
+            if self.config.train_cfg:
+                noise_pred = self.sd_pipeline.unet(
+                    torch.cat([latents] * 2),
+                    torch.cat([timesteps] * 2),
+                    embeds,
+                ).sample
+                noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                noise_pred = noise_pred_uncond + self.config.sample_guidance_scale * (
+                        noise_pred_text - noise_pred_uncond
+                )
+            else:
+                noise_pred = self.sd_pipeline.unet(
+                    latents,
+                    timesteps,
+                    embeds,
+                ).sample
+            # compute the log prob of next_latents given latents under the current model
+
+            scheduler_step_output = self.sd_pipeline.scheduler_step(
+                noise_pred,
+                timesteps,
+                latents,
+                eta=self.config.sample_eta,
+                prev_sample=next_latents,
+            )
+
+            log_prob = scheduler_step_output.log_probs.float()
+
+        log_probs = log_probs.float()
+        advantages = torch.clamp(
+            advantages.float(),
+            -self.config.train_adv_clip_max,
+            self.config.train_adv_clip_max,
+        )
+
+        ratio = torch.exp(log_prob - log_probs)
+
+        loss = self.loss(advantages, self.config.train_clip_range, ratio)
+
+        approx_kl = 0.5 * torch.mean((log_prob - log_probs) ** 2)
+
+        clipfrac = torch.mean((torch.abs(ratio - 1.0) > self.config.train_clip_range).float())
+
+        return loss, approx_kl, clipfrac
 
     def _generate_samples(self, iterations, batch_size):
         """
@@ -386,7 +472,7 @@ class GaudiDDPOTrainer(DDPOTrainer):
             ).input_ids.to(self.accelerator.device)
             prompt_embeds = self.sd_pipeline.text_encoder(prompt_ids)[0]
 
-            with self.autocast():
+            with torch.autocast(device_type=self.accelerator.device.type, dtype=torch.bfloat16, enabled=self.use_autocast):
                 sd_output = self.sd_pipeline(
                     prompt_embeds=prompt_embeds,
                     negative_prompt_embeds=sample_neg_prompt_embeds,
@@ -443,7 +529,7 @@ class GaudiDDPOTrainer(DDPOTrainer):
         """
         info = defaultdict(list)
 
-        for i, sample in enumerate(batched_samples):
+        for _i, sample in enumerate(batched_samples):
             if self.config.train_cfg:
                 # concat negative prompts to sample prompts to avoid two forward passes
                 embeds = torch.cat([sample["negative_prompt_embeds"], sample["prompt_embeds"]])
@@ -479,18 +565,25 @@ class GaudiDDPOTrainer(DDPOTrainer):
                     info["approx_kl"].append(approx_kl)
                     info["clipfrac"].append(clipfrac)
                     info["loss"].append(loss)
-
+                    logger.info(f"KL: {approx_kl}, Loss: {loss}, Clipfrac: {clipfrac}")
                     self.accelerator.backward(loss)
+                    if self.use_habana:
+                        self.htcore.mark_step()
+
                     if self.accelerator.sync_gradients:
-                        self.accelerator.clip_grad_norm_(
-                            self.trainable_layers.parameters()
-                            if not isinstance(self.trainable_layers, list)
-                            else self.trainable_layers,
-                            self.config.train_max_grad_norm,
-                        )
+                        trainable_layers =  self.trainable_layers.parameters() if not isinstance(self.trainable_layers, list) else self.trainable_layers
+                        if self.gaudi_config.use_fused_clip_norm:
+                            self.FusedNorm.clip_norm(
+                                trainable_layers
+                            )
+                        else:
+                            self.self.accelerator.clip_grad_norm_(
+                                trainable_layers,
+                                self.config.train_max_grad_norm,
+                            )
                     self.optimizer.step()
                     self.optimizer.zero_grad()
-                    if self.use_habana and not self.use_hpu_graphs:
+                    if self.use_habana:
                         self.htcore.mark_step()
 
                 # Checks if the accelerator has performed an optimization step behind the scenes
@@ -504,3 +597,18 @@ class GaudiDDPOTrainer(DDPOTrainer):
                     info = defaultdict(list)
 
         return global_step
+
+    def _setup_optimizer(self, trainable_layers_parameters):
+        if self.use_habana and self.gaudi_config.use_fused_adam:
+            from habana_frameworks.torch.hpex.optimizers import FusedAdamW
+            optimizer_cls = FusedAdamW
+        else:
+            optimizer_cls = torch.optim.AdamW
+
+        return optimizer_cls(
+            trainable_layers_parameters,
+            lr=self.config.train_learning_rate,
+            betas=(self.config.train_adam_beta1, self.config.train_adam_beta2),
+            weight_decay=self.config.train_adam_weight_decay,
+            eps=self.config.train_adam_epsilon,
+        )

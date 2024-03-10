@@ -21,7 +21,7 @@
 #   - cast model to bf16.
 
 """
-python examples/scripts/ddpo.py \
+python examples/trl/ddpo.py \
     --num_epochs=200 \
     --train_gradient_accumulation_steps=1 \
     --sample_num_steps=50 \
@@ -65,13 +65,13 @@ class ScriptArguments:
         default="aesthetic-model.pth",
         metadata={"help": "HuggingFace model filename for aesthetic scorer model weights"},
     )
-    use_lora: bool = field(default=True, metadata={"help": "Whether to use LoRA."}),
+    use_lora: bool = field(default=True, metadata={"help": "Whether to use LoRA."})
     gaudi_config_name: str = field(
         default="Habana/stable-diffusion",
         metadata={"help": "Name or path of the Gaudi configuration"}
     )
     push_to_hub: bool = field(
-        default=True,
+        default=False,
         metadata={"help": "Whether or not to push the model to the Hub."}
     )
     use_habana:  bool = field(
@@ -79,7 +79,7 @@ class ScriptArguments:
         metadata={"help": "Whether or not to use HPU."}
     )
     use_hpu_graphs:  bool = field(
-        default=False,
+        default=True,
         metadata={"help": "Whether or not to use hpu graphs."}
     )
 
@@ -197,11 +197,9 @@ def image_outputs_logger(image_data, global_step, accelerate_logger):
     images, prompts, _, rewards, _ = image_data[-1]
 
     for i, image in enumerate(images):
-        if image.dtype == torch.bfloat16:
-            image = image.float()  # bf16 not supported by numpy
         prompt = prompts[i]
         reward = rewards[i].item()
-        result[f"{prompt:.25} | {reward:.2f}"] = image.unsqueeze(0)
+        result[f"{prompt:.25} | {reward:.2f}"] = image.unsqueeze(0).float()
 
     accelerate_logger.log_images(
         result,
@@ -221,6 +219,7 @@ if __name__ == "__main__":
         "project_dir": "./save",
     }
 
+    torch.manual_seed(42)
     # 1. initialize Gaudi config:
     gaudi_config = GaudiConfig.from_pretrained(args.gaudi_config_name) if args.use_habana else None
 
@@ -252,3 +251,5 @@ if __name__ == "__main__":
 
     if args.push_to_hub:
         trainer.push_to_hub(args.hf_hub_model_id, token=args.hf_user_access_token)
+    else:
+        trainer.save_pretrained(args.hf_hub_model_id)

@@ -41,7 +41,7 @@ class GaudiDDPOTrainerTester(unittest.TestCase):
             per_prompt_stat_tracking_buffer_size=32,
             sample_num_batches_per_epoch=2,
             sample_batch_size=2,
-            mixed_precision=None,
+            mixed_precision="bf16",
             save_freq=1000000,
         )
         pretrained_model = "hf-internal-testing/tiny-stable-diffusion-torch"
@@ -51,9 +51,9 @@ class GaudiDDPOTrainerTester(unittest.TestCase):
         pipeline = GaudiDefaultDDPOStableDiffusionPipeline(
             pretrained_model,
             pretrained_model_revision=pretrained_revision,
-            use_lora=False,
+            use_lora=True,
             gaudi_config=gaudi_config,
-            use_habana=True,
+            use_habana=False,
             use_hpu_graphs=False
         )
 
