@@ -32,6 +32,12 @@ def prompt_function():
 class GaudiDDPOTrainerTester(unittest.TestCase):
     """
     Test the GaudiDDPOTrainer class.
+
+    Adapted from https://github.com/huggingface/trl/blob/main/tests/test_ddpo_trainer.py
+    The main changes are:
+     - use GaudiDefaultDDPOStableDiffusionPipeline instead of DefaultDDPOStableDiffusionPipeline
+     - use GaudiDDPOTrainer instead of DDPOTrainer
+     - use bf16 instead of fp32
     """
 
     def setUp(self):
@@ -120,7 +126,7 @@ class GaudiDDPOTrainerWithLoRATester(GaudiDDPOTrainerTester):
             per_prompt_stat_tracking_buffer_size=32,
             sample_num_batches_per_epoch=2,
             sample_batch_size=2,
-            mixed_precision=None,
+            mixed_precision="bf16",
             save_freq=1000000,
         )
         pretrained_model = "hf-internal-testing/tiny-stable-diffusion-torch"

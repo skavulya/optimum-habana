@@ -212,7 +212,6 @@ if __name__ == "__main__":
         "project_dir": "./save",
     }
 
-    torch.manual_seed(42)
     # 1. initialize Gaudi config:
     gaudi_config = GaudiConfig.from_pretrained(args.gaudi_config_name) if args.use_habana else None
 
