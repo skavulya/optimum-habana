@@ -35,6 +35,7 @@ python ddpo.py \
     --log_with="tensorboard" \
     --bf16
 """
+
 import os
 from dataclasses import dataclass, field
 
@@ -68,26 +69,13 @@ class ScriptArguments:
         metadata={"help": "HuggingFace model filename for aesthetic scorer model weights"},
     )
     use_lora: bool = field(default=True, metadata={"help": "Whether to use LoRA."})
-    bf16: bool = field(
-        default=False,
-        metadata={"help": "Whether to use bf16 mixed precision."}
-    )
+    bf16: bool = field(default=False, metadata={"help": "Whether to use bf16 mixed precision."})
     gaudi_config_name: str = field(
-        default="Habana/stable-diffusion",
-        metadata={"help": "Name or path of the Gaudi configuration"}
+        default="Habana/stable-diffusion", metadata={"help": "Name or path of the Gaudi configuration"}
     )
-    push_to_hub: bool = field(
-        default=False,
-        metadata={"help": "Whether or not to push the model to the Hub."}
-    )
-    use_habana:  bool = field(
-        default=True,
-        metadata={"help": "Whether or not to use HPU."}
-    )
-    use_hpu_graphs:  bool = field(
-        default=True,
-        metadata={"help": "Whether or not to use hpu graphs."}
-    )
+    push_to_hub: bool = field(default=False, metadata={"help": "Whether or not to push the model to the Hub."})
+    use_habana: bool = field(default=True, metadata={"help": "Whether or not to use HPU."})
+    use_hpu_graphs: bool = field(default=True, metadata={"help": "Whether or not to use hpu graphs."})
 
 
 class MLP(nn.Module):
@@ -148,9 +136,9 @@ def aesthetic_scorer(hub_model_id, model_filename, use_habana=True):
         dtype=torch.float32,
     )
     if use_habana:
-        scorer = scorer.to('hpu')
+        scorer = scorer.to("hpu")
     else:
-        scorer = scorer.to('cpu')
+        scorer = scorer.to("cpu")
 
     def _fn(images, prompts, metadata):
         images = (images * 255).round().clamp(0, 255).to(torch.uint8)
@@ -214,7 +202,6 @@ def image_outputs_logger(image_data, global_step, accelerate_logger):
 
 
 if __name__ == "__main__":
-
     parser = HfArgumentParser((ScriptArguments, DDPOConfig))
     args, ddpo_config = parser.parse_args_into_dataclasses()
     ddpo_config.mixed_precision = "bf16" if args.bf16 else "no"

@@ -54,7 +54,7 @@ class GaudiDDPOTrainerTester(unittest.TestCase):
             use_lora=True,
             gaudi_config=gaudi_config,
             use_habana=False,
-            use_hpu_graphs=False
+            use_hpu_graphs=False,
         )
 
         self.trainer = GaudiDDPOTrainer(
@@ -64,7 +64,7 @@ class GaudiDDPOTrainerTester(unittest.TestCase):
             pipeline,
             gaudi_config=gaudi_config,
             use_habana=True,
-            use_hpu_graphs=False
+            use_hpu_graphs=False,
         )
 
         return super().setUp()

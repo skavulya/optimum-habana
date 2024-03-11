@@ -232,6 +232,7 @@ class GaudiDDPOTrainer(DDPOTrainer):
 
         if use_hpu_graphs:
             import habana_frameworks.torch as ht
+
             ht.hpu.ModuleCacher()(model=self.sd_pipeline.unet, inplace=True)
 
         if self.config.async_reward_computation:
@@ -322,7 +323,7 @@ class GaudiDDPOTrainer(DDPOTrainer):
         pbar = tqdm(
             range(self.config.train_num_inner_epochs),
             desc=f"Epoch {epoch}",
-            disable=not self.accelerator.is_main_process
+            disable=not self.accelerator.is_main_process,
         )
         for inner_epoch in pbar:
             # shuffle samples along batch dimension
@@ -396,7 +397,7 @@ class GaudiDDPOTrainer(DDPOTrainer):
                 ).sample
                 noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
                 noise_pred = noise_pred_uncond + self.config.sample_guidance_scale * (
-                        noise_pred_text - noise_pred_uncond
+                    noise_pred_text - noise_pred_uncond
                 )
             else:
                 noise_pred = self.sd_pipeline.unet(
@@ -534,7 +535,7 @@ class GaudiDDPOTrainer(DDPOTrainer):
             next_latents = sample["next_latents"]
             log_probs = sample["log_probs"]
 
-            for j in range(self.num_train_timesteps): #, desc=f"Epoch{i}"):
+            for j in range(self.num_train_timesteps):  # , desc=f"Epoch{i}"):
                 with self.accelerator.accumulate(self.sd_pipeline.unet):
                     # Reduce recompilations by avoiding constant variables in loops
                     latent = latents[:, 0]
@@ -563,11 +564,13 @@ class GaudiDDPOTrainer(DDPOTrainer):
                         self.htcore.mark_step()
 
                     if self.accelerator.sync_gradients:
-                        trainable_layers =  self.trainable_layers.parameters() if not isinstance(self.trainable_layers, list) else self.trainable_layers
+                        trainable_layers = (
+                            self.trainable_layers.parameters()
+                            if not isinstance(self.trainable_layers, list)
+                            else self.trainable_layers
+                        )
                         if self.gaudi_config.use_fused_clip_norm:
-                            self.FusedNorm.clip_norm(
-                                trainable_layers
-                            )
+                            self.FusedNorm.clip_norm(trainable_layers)
                         else:
                             self.self.accelerator.clip_grad_norm_(
                                 trainable_layers,
@@ -593,6 +596,7 @@ class GaudiDDPOTrainer(DDPOTrainer):
     def _setup_optimizer(self, trainable_layers_parameters):
         if self.use_habana and self.gaudi_config.use_fused_adam:
             from habana_frameworks.torch.hpex.optimizers import FusedAdamW
+
             optimizer_cls = FusedAdamW
         else:
             optimizer_cls = torch.optim.AdamW

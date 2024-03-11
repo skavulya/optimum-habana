@@ -309,7 +309,7 @@ def pipeline_step(
     if ip_adapter_image is not None:
         image_embeds = self.prepare_ip_adapter_image_embeds(
             ip_adapter_image, device, batch_size * num_images_per_prompt
-    )
+        )
 
     # 4. Prepare timesteps
     self.scheduler.set_timesteps(num_inference_steps, device="cpu")
@@ -337,9 +337,7 @@ def pipeline_step(
     added_cond_kwargs = {"image_embeds": image_embeds} if ip_adapter_image is not None else None
     timestep_cond = None
     if self.unet.config.time_cond_proj_dim is not None:
-        guidance_scale_tensor = torch.tensor(self.guidance_scale - 1).repeat(
-            batch_size * num_images_per_prompt
-        )
+        guidance_scale_tensor = torch.tensor(self.guidance_scale - 1).repeat(batch_size * num_images_per_prompt)
         timestep_cond = self.get_guidance_scale_embedding(
             guidance_scale_tensor, embedding_dim=self.unet.config.time_cond_proj_dim
         ).to(device=device, dtype=latents.dtype)
@@ -355,13 +353,8 @@ def pipeline_step(
 
             # predict the noise residual
             noise_pred = self.unet_hpu(
-                        latent_model_input,
-                        t,
-                        prompt_embeds,
-                        timestep_cond,
-                        cross_attention_kwargs,
-                        added_cond_kwargs
-                    )
+                latent_model_input, t, prompt_embeds, timestep_cond, cross_attention_kwargs, added_cond_kwargs
+            )
 
             # perform guidance
             if do_classifier_free_guidance:
@@ -413,14 +406,17 @@ def pipeline_step(
 
 
 class GaudiDefaultDDPOStableDiffusionPipeline(DefaultDDPOStableDiffusionPipeline):
-    def __init__(self, pretrained_model_name: str,
-                 *, pretrained_model_revision: str = "main",
-                 use_lora: bool = True,
-                 use_habana: bool = False,
-                 use_hpu_graphs: bool = False,
-                 gaudi_config: Union[str, GaudiConfig] = None,
-                 bf16_full_eval: bool = False,
-                 ):
+    def __init__(
+        self,
+        pretrained_model_name: str,
+        *,
+        pretrained_model_revision: str = "main",
+        use_lora: bool = True,
+        use_habana: bool = False,
+        use_hpu_graphs: bool = False,
+        gaudi_config: Union[str, GaudiConfig] = None,
+        bf16_full_eval: bool = False,
+    ):
         """
         Adapted from: https://github.com/huggingface/trl/blob/v0.7.6/trl/models/modeling_sd_base.py#L526
         - use GaudiStableDiffusionPipeline instead of StableDiffusionPipeline
@@ -450,7 +446,7 @@ class GaudiDefaultDDPOStableDiffusionPipeline(DefaultDDPOStableDiffusionPipeline
             use_habana=use_habana,
             use_hpu_graphs=use_hpu_graphs,
             gaudi_config=gaudi_config,
-            torch_dtype=torch.bfloat16 if bf16_full_eval else torch.float32
+            torch_dtype=torch.bfloat16 if bf16_full_eval else torch.float32,
         )
 
         self.use_lora = use_lora
