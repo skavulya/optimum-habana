@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import contextlib
+
 import os
 from collections import defaultdict
 from concurrent import futures
@@ -209,12 +209,7 @@ class GaudiDDPOTrainer(DDPOTrainer):
                 config.per_prompt_stat_tracking_min_count,
             )
 
-        # Workaround for ddpo loss instability in v1.14.0 when autocast is enabled for lora training
-        self.use_lora = hasattr(self.sd_pipeline, "use_lora") and self.sd_pipeline.use_lora
-        self.use_autocast = self.gaudi_config.use_torch_autocast if self.gaudi_config else True
-        self.autocast = contextlib.nullcontext if self.use_lora else self.accelerator.autocast
-
-        if self.use_lora:
+        if hasattr(self.sd_pipeline, "use_lora") and self.sd_pipeline.use_lora:
             unet, self.optimizer = self.accelerator.prepare(trainable_layers, self.optimizer)
             self.trainable_layers = list(filter(lambda p: p.requires_grad, unet.parameters()))
         else:
@@ -331,15 +326,13 @@ class GaudiDDPOTrainer(DDPOTrainer):
         )
         for inner_epoch in pbar:
             # shuffle samples along batch dimension
-            #perm = torch.randperm(total_batch_size, device=self.accelerator.device)
-            rand_device = 'cpu' if self.accelerator.device.type == 'hpu' else self.accelerator.device
-            perm = torch.randperm(total_batch_size, device=rand_device).to(self.accelerator.device)
+            perm = torch.randperm(total_batch_size, device=self.accelerator.device)
             samples = {k: v[perm] for k, v in samples.items()}
 
             # shuffle along time dimension independently for each sample
             # still trying to understand the code below
             perms = torch.stack(
-                [torch.randperm(num_timesteps, device=rand_device).to(self.accelerator.device) for _ in range(total_batch_size)]
+                [torch.randperm(num_timesteps, device=self.accelerator.device) for _ in range(total_batch_size)]
             )
 
             for key in ["timesteps", "latents", "next_latents", "log_probs"]:
@@ -394,7 +387,7 @@ class GaudiDDPOTrainer(DDPOTrainer):
             loss (torch.Tensor), approx_kl (torch.Tensor), clipfrac (torch.Tensor)
             (all of these are of shape (1,))
         """
-        with torch.autocast(device_type=self.accelerator.device.type, dtype=torch.bfloat16, enabled=self.use_autocast):
+        with self.accelerator.autocast():
             if self.config.train_cfg:
                 noise_pred = self.sd_pipeline.unet(
                     torch.cat([latents] * 2),
@@ -472,7 +465,7 @@ class GaudiDDPOTrainer(DDPOTrainer):
             ).input_ids.to(self.accelerator.device)
             prompt_embeds = self.sd_pipeline.text_encoder(prompt_ids)[0]
 
-            with torch.autocast(device_type=self.accelerator.device.type, dtype=torch.bfloat16, enabled=self.use_autocast):
+            with self.accelerator.autocast():
                 sd_output = self.sd_pipeline(
                     prompt_embeds=prompt_embeds,
                     negative_prompt_embeds=sample_neg_prompt_embeds,
@@ -565,7 +558,6 @@ class GaudiDDPOTrainer(DDPOTrainer):
                     info["approx_kl"].append(approx_kl)
                     info["clipfrac"].append(clipfrac)
                     info["loss"].append(loss)
-                    logger.info(f"KL: {approx_kl}, Loss: {loss}, Clipfrac: {clipfrac}")
                     self.accelerator.backward(loss)
                     if self.use_habana:
                         self.htcore.mark_step()

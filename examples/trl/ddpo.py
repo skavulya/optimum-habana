@@ -21,17 +21,19 @@
 #   - cast model to bf16.
 
 """
-python examples/trl/ddpo.py \
+python ddpo.py \
     --num_epochs=200 \
     --train_gradient_accumulation_steps=1 \
     --sample_num_steps=50 \
     --sample_batch_size=6 \
     --train_batch_size=3 \
     --sample_num_batches_per_epoch=4 \
+    --train_learning_rate=1e-05 \
     --per_prompt_stat_tracking=True \
     --per_prompt_stat_tracking_buffer_size=32 \
     --tracker_project_name="stable_diffusion_training" \
-    --log_with="tensorboard"
+    --log_with="tensorboard" \
+    --bf16
 """
 import os
 from dataclasses import dataclass, field
@@ -66,6 +68,10 @@ class ScriptArguments:
         metadata={"help": "HuggingFace model filename for aesthetic scorer model weights"},
     )
     use_lora: bool = field(default=True, metadata={"help": "Whether to use LoRA."})
+    bf16: bool = field(
+        default=False,
+        metadata={"help": "Whether to use bf16 mixed precision."}
+    )
     gaudi_config_name: str = field(
         default="Habana/stable-diffusion",
         metadata={"help": "Name or path of the Gaudi configuration"}
@@ -211,7 +217,7 @@ if __name__ == "__main__":
 
     parser = HfArgumentParser((ScriptArguments, DDPOConfig))
     args, ddpo_config = parser.parse_args_into_dataclasses()
-    ddpo_config.mixed_precision = "bf16"
+    ddpo_config.mixed_precision = "bf16" if args.bf16 else "no"
     ddpo_config.project_kwargs = {
         "logging_dir": "./logs",
         "automatic_checkpoint_naming": True,
