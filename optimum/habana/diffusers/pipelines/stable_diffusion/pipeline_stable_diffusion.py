@@ -96,6 +96,44 @@ def retrieve_timesteps(
     return timesteps, num_inference_steps
 
 
+def reset_timesteps(
+        scheduler,
+        num_inference_steps: Optional[int] = None,
+        device: Optional[Union[str, torch.device]] = None,
+        timesteps: Optional[List[int]] = None,
+        **kwargs,
+):
+    """
+    Resets timesteps to process the next batch and calls `retrieve_timesteps`.
+
+    Args:
+        scheduler (`SchedulerMixin`):
+            The scheduler to get timesteps from.
+        num_inference_steps (`int`):
+            The number of diffusion steps used when generating samples with a pre-trained model. If used,
+            `timesteps` must be `None`.
+        device (`str` or `torch.device`, *optional*):
+            The device to which the timesteps should be moved to. If `None`, the timesteps are not moved.
+        timesteps (`List[int]`, *optional*):
+                Custom timesteps used to support arbitrary spacing between timesteps. If `None`, then the default
+                timestep spacing strategy of the scheduler is used. If `timesteps` is passed, `num_inference_steps`
+                must be `None`.
+
+    Returns:
+        `Tuple[torch.Tensor, int]`: A tuple where the first element is the timestep schedule from the scheduler and the
+        second element is the number of inference steps.
+    """
+    accepts_timesteps = False
+    if timesteps is not None:
+        accepts_timesteps = "timesteps" in set(inspect.signature(scheduler.set_timesteps).parameters.keys())
+
+    if accepts_timesteps:
+        timesteps, num_inference_steps = retrieve_timesteps(scheduler, num_inference_steps, device, timesteps)
+    else:
+        timesteps, num_inference_steps = retrieve_timesteps(scheduler, num_inference_steps, device)
+
+    return timesteps, num_inference_steps
+
 class GaudiStableDiffusionPipeline(GaudiDiffusionPipeline, StableDiffusionPipeline):
     """
     Adapted from: https://github.com/huggingface/diffusers/blob/v0.23.1/src/diffusers/pipelines/stable_diffusion/pipeline_stable_diffusion.py#L73
@@ -573,6 +611,9 @@ class GaudiStableDiffusionPipeline(GaudiDiffusionPipeline, StableDiffusionPipeli
                         callback(step_idx, timestep, latents_batch)
 
                     hb_profiler.step()
+
+                # Reset scheduler for next batch
+                timesteps, _ = reset_timesteps(self.scheduler, num_inference_steps, device, timesteps)
 
                 if use_warmup_inference_steps:
                     t1 = warmup_inference_steps_time_adjustment(

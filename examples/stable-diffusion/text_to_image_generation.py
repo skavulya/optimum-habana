@@ -21,10 +21,10 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from optimum.habana.diffusers import (
-    GaudiDDIMScheduler,
-    GaudiEulerAncestralDiscreteScheduler,
-    GaudiEulerDiscreteScheduler,
+from diffusers import (
+    DDIMScheduler,
+    EulerAncestralDiscreteScheduler,
+    EulerDiscreteScheduler,
 )
 from optimum.habana.utils import set_seed
 
@@ -297,15 +297,15 @@ def main():
     # Initialize the scheduler and the generation pipeline
     kwargs = {"timestep_spacing": args.timestep_spacing}
     if args.scheduler == "euler_discrete":
-        scheduler = GaudiEulerDiscreteScheduler.from_pretrained(
+        scheduler = EulerDiscreteScheduler.from_pretrained(
             args.model_name_or_path, subfolder="scheduler", **kwargs
         )
     elif args.scheduler == "euler_ancestral_discrete":
-        scheduler = GaudiEulerAncestralDiscreteScheduler.from_pretrained(
+        scheduler = EulerAncestralDiscreteScheduler.from_pretrained(
             args.model_name_or_path, subfolder="scheduler", **kwargs
         )
     else:
-        scheduler = GaudiDDIMScheduler.from_pretrained(args.model_name_or_path, subfolder="scheduler", **kwargs)
+        scheduler = DDIMScheduler.from_pretrained(args.model_name_or_path, subfolder="scheduler", **kwargs)
 
     kwargs = {
         "scheduler": scheduler,

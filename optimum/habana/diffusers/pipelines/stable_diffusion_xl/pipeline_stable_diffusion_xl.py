@@ -39,7 +39,7 @@ from optimum.utils import logging
 from ....transformers.gaudi_configuration import GaudiConfig
 from ....utils import HabanaProfile, speed_metrics, warmup_inference_steps_time_adjustment
 from ..pipeline_utils import GaudiDiffusionPipeline
-from ..stable_diffusion.pipeline_stable_diffusion import retrieve_timesteps
+from ..stable_diffusion.pipeline_stable_diffusion import retrieve_timesteps, reset_timesteps
 
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
@@ -788,6 +788,9 @@ class GaudiStableDiffusionXLPipeline(GaudiDiffusionPipeline, StableDiffusionXLPi
                             callback(step_idx, timestep, latents)
 
                     hb_profiler.step()
+
+                # Reset scheduler for next batch
+                timesteps, _ = reset_timesteps(self.scheduler, num_inference_steps, device, timesteps)
 
                 if use_warmup_inference_steps:
                     t1 = warmup_inference_steps_time_adjustment(
