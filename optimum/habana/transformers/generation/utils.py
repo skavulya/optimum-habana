@@ -140,7 +140,10 @@ def get_final_stopping_criteria(x):
     if isinstance(x, bool):
         return x
     elif torch.is_tensor(x):
-        return all(x)
+        if x.dim() > 0:
+            return all(x)
+        else:
+            return x
     else:
         raise TypeError(f"The stopping criteria should be either a boolean or a torch.tensor but got {type(x)}.")
 
@@ -297,6 +300,7 @@ class GaudiGenerationMixin(GenerationMixin):
                     key != "token_idx"
                     and key != "decoder_input_ids"
                     and key != "cache_position"
+                    and key != "inputs_embeds_offset"
                     and dict_to_expand[key] is not None
                     and isinstance(dict_to_expand[key], torch.Tensor)
                 ):
@@ -914,14 +918,44 @@ class GaudiGenerationMixin(GenerationMixin):
                 # only pad if bucket_size < -1. If we are bucketing (bucket_size > 0), then that is taken care in greedy_search()
                 if not is_greedy_or_beam_and_bucket:
                     # token_idx is the current index in the generation process, it is incremented each time a new token is generated
-                    token_idx = inputs_tensor.shape[-1]
-                    model_kwargs["token_idx"] = torch.tensor(token_idx, device=inputs_tensor.device)
-                    model_kwargs["token_idx_cpu"] = token_idx
+                    token_idx = inputs_tensor.shape[1]
                     if generation_config.max_new_tokens is None:
                         generation_config.max_new_tokens = generation_config.max_length - token_idx
-                    inputs_tensor = torch.nn.functional.pad(
-                        inputs_tensor, (0, generation_config.max_new_tokens), value=generation_config.pad_token_id
-                    )
+                    if "inputs_embeds" in model_kwargs:
+                        if "input_ids" in model_kwargs:
+                            inputs_embeds_offset = (
+                                model_kwargs["input_ids"].shape[1] - model_kwargs["inputs_embeds"].shape[1]
+                            )
+                            model_kwargs["input_ids"] = torch.nn.functional.pad(
+                                model_kwargs["input_ids"],
+                                (0, generation_config.max_new_tokens),
+                                value=generation_config.pad_token_id,
+                            )
+                        else:
+                            inputs_embeds_offset = -model_kwargs["inputs_embeds"].shape[1]
+
+                        model_kwargs["inputs_embeds_offset"] = torch.tensor(
+                            inputs_embeds_offset, device=inputs_tensor.device
+                        )
+                        model_kwargs["inputs_embeds"] = torch.nn.functional.pad(
+                            model_kwargs["inputs_embeds"],
+                            (0, 0, 0, generation_config.max_new_tokens),
+                            value=generation_config.pad_token_id,
+                        )
+
+                    if model_input_name == "inputs_embeds":
+                        inputs_tensor = torch.nn.functional.pad(
+                            inputs_tensor,
+                            (0, 0, 0, generation_config.max_new_tokens),
+                            value=generation_config.pad_token_id,
+                        )
+                    else:
+                        inputs_tensor = torch.nn.functional.pad(
+                            inputs_tensor, (0, generation_config.max_new_tokens), value=generation_config.pad_token_id
+                        )
+                    model_kwargs["token_idx"] = torch.tensor(token_idx, device=inputs_tensor.device)
+                    model_kwargs["token_idx_cpu"] = token_idx
+
                     for other_inputs in ["attention_mask", "token_type_ids"]:
                         if model_kwargs.get(other_inputs) is not None:
                             model_kwargs[other_inputs] = torch.nn.functional.pad(
@@ -2217,7 +2251,10 @@ class GaudiGenerationMixin(GenerationMixin):
         token_idx = model_kwargs.get("token_idx", None)
         if token_idx is not None:
             # Update cur_len in case of static shapes
-            cur_len = token_idx.item()
+            if "inputs_embeds_offset" in model_kwargs:
+                cur_len = (token_idx + model_kwargs["inputs_embeds_offset"]).item()
+            else:
+                cur_len = token_idx.item()
 
         time_to_first_token_done = False
         model_kwargs["pad_done"] = False
@@ -2321,9 +2358,12 @@ class GaudiGenerationMixin(GenerationMixin):
                 next_tokens = next_tokens.to(input_ids.dtype)
 
             if token_idx is not None:
-                input_ids.index_copy_(
-                    1, token_idx, next_tokens.unsqueeze(-1) if next_tokens.dim() == 1 else next_tokens
+                idx = (
+                    token_idx + model_kwargs["inputs_embeds_offset"]
+                    if "inputs_embeds_offset" in model_kwargs
+                    else token_idx
                 )
+                input_ids.index_copy_(1, idx, next_tokens.unsqueeze(-1) if next_tokens.dim() == 1 else next_tokens)
             else:
                 input_ids = torch.cat([input_ids, next_tokens[:, None]], dim=-1)
 
